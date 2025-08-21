@@ -9,7 +9,7 @@ from typing import Optional, Set
 import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType, ChatMemberStatus
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, Update, User, ChatMemberUpdated, CallbackQuery
@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS pending_tokens (
   collector_message_id BIGINT
 );
 CREATE INDEX IF NOT EXISTS idx_pending_tokens_expires ON pending_tokens (expires_at);
+CREATE INDEX IF NOT EXISTS idx_pending_tokens_from ON pending_tokens (from_id);
 
 CREATE TABLE IF NOT EXISTS waiting_text (
   user_id BIGINT PRIMARY KEY,
@@ -109,14 +110,6 @@ async def gc():
         await con.execute("DELETE FROM waiting_text WHERE expires_at < $1", now)
 
 # ---------- DB helpers ----------
-async def pending_latest_for_user(user_id: int, limit: int = 3):
-    async with pool.acquire() as con:
-        rows = await con.fetch(
-            "SELECT * FROM pending_tokens WHERE from_id=$1 AND expires_at > $2 ORDER BY expires_at DESC LIMIT $3",
-            user_id, utc_now(), limit,
-        )
-    return rows
-
 async def pending_create(token: str, from_id: int, target_id: int, chat_id: int, chat_title: str):
     async with pool.acquire() as con:
         await con.execute(
@@ -131,6 +124,14 @@ async def pending_set_collector_msg(token: str, msg_id: int):
 async def pending_get(token: str):
     async with pool.acquire() as con:
         return await con.fetchrow("SELECT * FROM pending_tokens WHERE token=$1", token)
+
+async def pending_latest_for_user(user_id: int, limit: int = 3):
+    async with pool.acquire() as con:
+        rows = await con.fetch(
+            "SELECT * FROM pending_tokens WHERE from_id=$1 AND expires_at > $2 ORDER BY expires_at DESC LIMIT $3",
+            user_id, utc_now(), limit,
+        )
+    return rows
 
 async def waiting_set(user_id: int, token: str, target_id: int, chat_id: int, chat_title: str):
     async with pool.acquire() as con:
@@ -232,7 +233,11 @@ async def track_group_membership(event: ChatMemberUpdated):
             await bot.send_message(ADMIN_ID, f"➖ بات از گروه «{html.escape(chat.title or str(chat.id))}» حذف/غیرفعال شد. (chat_id: <code>{chat.id}</code>)")
 
 # ---------- Trigger in group ----------
-@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.reply_to_message, F.text.regexp(r'^\s*(نجوا(?:\s*ربات)?|whisper)\s*$'))
+@dp.message(
+    F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+    F.reply_to_message,
+    F.text.regexp(r'^\s*(نجوا(?:\s*ربات)?|whisper)\s*$')
+)
 async def whisper_trigger(msg: Message):
     await gc()
     await groups_upsert(msg.chat.id, msg.chat.title or "گروه", True)
@@ -246,9 +251,12 @@ async def whisper_trigger(msg: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✍️ ارسال متن نجوا در پی‌وی", url=f"https://t.me/{BOT_USERNAME}?start=wh_{token}")
     ]])
-    helper = await msg.reply("برای نوشتن متن نجوا، به پی‌وی من بیایید (دکمه را بزنید).\nاگر فقط /start آمد، این کد را در پی‌وی بفرستید: <code>wh_%s</code>" % token, reply_markup=kb)
+    helper_text = (
+        "برای نوشتن متن نجوا، به پی‌وی من بیایید (دکمه را بزنید).\n"
+        f"اگر فقط /start آمد، این کد را در پی‌وی بفرستید: <code>wh_{token}</code>"
+    )
+    helper = await msg.reply(helper_text, reply_markup=kb)
 
-    # tie helper id
     await pending_set_collector_msg(token, helper.message_id)
 
     # delete the trigger only
@@ -266,7 +274,8 @@ def start_kb():
 async def start(msg: Message):
     await gc()
     parts = msg.text.split(maxsplit=1)
-    # case 1: deep link with token
+
+    # 1) deep-link with parameter
     if len(parts) == 2 and parts[1].startswith("wh_"):
         token = parts[1][3:]
         pend = await pending_get(token)
@@ -276,7 +285,8 @@ async def start(msg: Message):
             return await msg.answer("⛔️ این لینک متعلق به شما نیست.", reply_markup=start_kb())
         await waiting_set(msg.from_user.id, token, pend["target_id"], pend["chat_id"], pend["chat_title"])
         return await msg.answer(f"✍️ متن نجوا را ارسال کن (حداکثر {MAX_ALERT_CHARS} کاراکتر). برای لغو: «انصراف».")
-    # case 2: no parameter — try to auto-bind the latest pending for this user
+
+    # 2) no parameter → auto-bind the latest pending for this user (if unique)
     open_rows = await pending_latest_for_user(msg.from_user.id, limit=2)
     if open_rows:
         if len(open_rows) == 1:
@@ -285,30 +295,22 @@ async def start(msg: Message):
             await waiting_set(msg.from_user.id, token, pend["target_id"], pend["chat_id"], pend["chat_title"])
             return await msg.answer(f"✍️ متن نجوا را ارسال کن (حداکثر {MAX_ALERT_CHARS} کاراکتر). برای لغو: «انصراف».")
         else:
-            # multiple open tokens; ask user to send the code
             codes = " یا ".join([f"<code>wh_{r['token']}</code>" for r in open_rows])
             return await msg.answer("ℹ️ چند درخواست نجوا باز دارید. یکی از این کدها را برایم بفرست تا ادامه دهیم: " + codes)
-    # onboarding
-    intro = (
-        "سلام! 👋
-"
-        "<b>ربات نجوا</b> — متن در پی‌وی جمع می‌شود، ولی نجوا به‌صورت پیام در گروه ثبت می‌شود.
 
-"
-        "روش استفاده:
-"
-        "1) من را به گروه اضافه کن.
-"
-        "2) روی پیام یک نفر ریپلای بزن و بنویس «نجوا».
-"
-        "3) دکمه را بزن و در پی‌وی متن نجوا را برای من بفرست (حداکثر {MAX_ALERT_CHARS} کاراکتر).
-"
-        "4) من در گروه یک پیام «نجوا» می‌گذارم که فقط گیرنده (و مالک ربات) می‌تواند آن را باز کند."
-    )
+    # 3) onboarding text (proper triple-quoted f-string)
+    intro = f"""سلام! 👋
+<b>ربات نجوا</b> — متن در پی‌وی جمع می‌شود، ولی نجوا به‌صورت پیام در گروه ثبت می‌شود.
+
+روش استفاده:
+1) من را به گروه اضافه کن.
+2) روی پیام یک نفر ریپلای بزن و بنویس «نجوا».
+3) دکمه را بزن و در پی‌وی متن نجوا را برای من بفرست (حداکثر {MAX_ALERT_CHARS} کاراکتر).
+4) من در گروه یک پیام «نجوا» می‌گذارم که فقط گیرنده (و مالک ربات) می‌تواند آن را باز کند.
+"""
     await msg.answer(intro, reply_markup=start_kb())
 
-
-# Accept manual token messages like "wh_xxx" to bind pending whisper
+# ---------- Accept manual token in DM (wh_...) ----------
 @dp.message(F.chat.type == ChatType.PRIVATE, F.text.regexp(r'^\s*wh_[A-Za-z0-9_-]{6,}\s*$'))
 async def dm_claim_token(msg: Message):
     token_param = msg.text.strip()
@@ -320,7 +322,8 @@ async def dm_claim_token(msg: Message):
         return await msg.answer("⛔️ این کد متعلق به شما نیست.")
     await waiting_set(msg.from_user.id, token, pend["target_id"], pend["chat_id"], pend["chat_title"])
     await msg.answer(f"✍️ متن نجوا را بفرست (حداکثر {MAX_ALERT_CHARS} کاراکتر). برای لغو: «انصراف».")
-# ---------- DM: collect text (no / needed) ----------
+
+# ---------- DM: collect text ----------
 @dp.message(F.chat.type == ChatType.PRIVATE, F.text)
 async def dm_collect(msg: Message):
     await gc()
@@ -356,11 +359,9 @@ async def dm_collect(msg: Message):
     await whisper_store(token, pend["from_id"], pend["target_id"], pend["chat_id"], pend["chat_title"], content)
 
     # Post final whisper message in group with read button
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📩 خواندن نجوا", callback_data=f"read:{token}")
-    ]])
-    shell = f"🔒 <b>نجوا</b> برای <a href=\"tg://user?id={pend['target_id']}\">گیرنده</a>"
-    posted = await bot.send_message(pend["chat_id"], shell, reply_markup=kb)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📩 خواندن نجوا", callback_data=f"read:{token}")]])
+    shell = f'🔒 <b>نجوا</b> برای <a href="tg://user?id={pend["target_id"]}">گیرنده</a>'
+    await bot.send_message(pend["chat_id"], shell, reply_markup=kb)
 
     # Delete the in-group helper message
     if pend["collector_message_id"]:
@@ -429,13 +430,6 @@ async def admin_or_help(msg: Message):
             except Exception:
                 fail += 1
         return await msg.answer(f"✅ ارسال جمعی تمام شد. موفق: {ok} | ناموفق: {fail}")
-
-# ---------- Helpers ----------
-def mention(u: User) -> str:
-    if u.username:
-        return f"@{u.username}"
-    name = u.full_name or "کاربر"
-    return f'<a href="tg://user?id={u.id}">{html.escape(name)}</a>'
 
 # ---------- Error swallow ----------
 @dp.update.outer_middleware()
