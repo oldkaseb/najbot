@@ -120,11 +120,9 @@ async def gc():
                 now
             )
         except Exception as e:
-            # fallback for older schema
             logger.warning("GC select fallback due to: %s", e)
         await con.execute("DELETE FROM waiting_text WHERE expires_at < $1", now)
 
-    # try to delete collectors from groups
     for r in rows or []:
         cid = r["chat_id"]
         mid = r["collector_message_id"]
@@ -259,8 +257,10 @@ async def group_whisper(msg: Message):
     await groups_upsert(msg.chat.id, msg.chat.title or "گروه", True)
 
     target = msg.reply_to_message.from_user
-    if not target or target.is_bot:
-        return
+    if not target:
+        return await msg.reply("روی پیام کاربرِ هدف ریپلای کنید.")
+    if target.is_bot:
+        return await msg.reply("روی پیامِ یک کاربر (نه ربات) ریپلای کنید.")
 
     token = secrets.token_urlsafe(16)
     await waiting_set(
@@ -288,6 +288,11 @@ async def group_whisper(msg: Message):
         await bot.delete_message(msg.chat.id, msg.message_id)
 
 # ---------- Start / Onboarding ---------
+def start_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="➕ افزودن به گروه", url=f"https://t.me/{BOT_USERNAME}?startgroup=true")
+    ]])
+
 @dp.message(CommandStart())
 async def start(msg: Message):
     await gc()
@@ -298,7 +303,7 @@ async def start(msg: Message):
         "2) روی پیام یک نفر ریپلای کن و بنویس «نجوا».\n"
         "3) به پی‌وی من بیا و اولین پیام متنی‌ات را بفرست."
     )
-    await msg.answer(intro)
+    await msg.answer(intro, reply_markup=start_kb())
 
 # ---------- Health & Ping ----------
 @dp.message(Command("ping"))
