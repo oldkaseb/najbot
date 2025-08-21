@@ -109,6 +109,14 @@ async def gc():
         await con.execute("DELETE FROM waiting_text WHERE expires_at < $1", now)
 
 # ---------- DB helpers ----------
+async def pending_latest_for_user(user_id: int, limit: int = 3):
+    async with pool.acquire() as con:
+        rows = await con.fetch(
+            "SELECT * FROM pending_tokens WHERE from_id=$1 AND expires_at > $2 ORDER BY expires_at DESC LIMIT $3",
+            user_id, utc_now(), limit,
+        )
+    return rows
+
 async def pending_create(token: str, from_id: int, target_id: int, chat_id: int, chat_title: str):
     async with pool.acquire() as con:
         await con.execute(
@@ -238,7 +246,7 @@ async def whisper_trigger(msg: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✍️ ارسال متن نجوا در پی‌وی", url=f"https://t.me/{BOT_USERNAME}?start=wh_{token}")
     ]])
-    helper = await msg.reply("برای نوشتن متن نجوا، به پی‌وی من بیایید (دکمه را بزنید).", reply_markup=kb)
+    helper = await msg.reply("برای نوشتن متن نجوا، به پی‌وی من بیایید (دکمه را بزنید).\nاگر فقط /start آمد، این کد را در پی‌وی بفرستید: <code>wh_%s</code>" % token, reply_markup=kb)
 
     # tie helper id
     await pending_set_collector_msg(token, helper.message_id)
@@ -258,6 +266,7 @@ def start_kb():
 async def start(msg: Message):
     await gc()
     parts = msg.text.split(maxsplit=1)
+    # case 1: deep link with token
     if len(parts) == 2 and parts[1].startswith("wh_"):
         token = parts[1][3:]
         pend = await pending_get(token)
@@ -267,18 +276,50 @@ async def start(msg: Message):
             return await msg.answer("⛔️ این لینک متعلق به شما نیست.", reply_markup=start_kb())
         await waiting_set(msg.from_user.id, token, pend["target_id"], pend["chat_id"], pend["chat_title"])
         return await msg.answer(f"✍️ متن نجوا را ارسال کن (حداکثر {MAX_ALERT_CHARS} کاراکتر). برای لغو: «انصراف».")
-
+    # case 2: no parameter — try to auto-bind the latest pending for this user
+    open_rows = await pending_latest_for_user(msg.from_user.id, limit=2)
+    if open_rows:
+        if len(open_rows) == 1:
+            token = open_rows[0]["token"]
+            pend = open_rows[0]
+            await waiting_set(msg.from_user.id, token, pend["target_id"], pend["chat_id"], pend["chat_title"])
+            return await msg.answer(f"✍️ متن نجوا را ارسال کن (حداکثر {MAX_ALERT_CHARS} کاراکتر). برای لغو: «انصراف».")
+        else:
+            # multiple open tokens; ask user to send the code
+            codes = " یا ".join([f"<code>wh_{r['token']}</code>" for r in open_rows])
+            return await msg.answer("ℹ️ چند درخواست نجوا باز دارید. یکی از این کدها را برایم بفرست تا ادامه دهیم: " + codes)
+    # onboarding
     intro = (
-        "سلام! 👋\n"
-        "<b>ربات نجوا</b> — متن در پی‌وی جمع می‌شود، ولی نجوا به‌صورت پیام در گروه ثبت می‌شود.\n\n"
-        "روش استفاده:\n"
-        "1) من را به گروه اضافه کن.\n"
-        "2) روی پیام یک نفر ریپلای بزن و بنویس «نجوا».\n"
-        "3) دکمه را بزن و در پی‌وی متن نجوا را برای من بفرست (حداکثر {MAX_ALERT_CHARS} کاراکتر).\n"
+        "سلام! 👋
+"
+        "<b>ربات نجوا</b> — متن در پی‌وی جمع می‌شود، ولی نجوا به‌صورت پیام در گروه ثبت می‌شود.
+
+"
+        "روش استفاده:
+"
+        "1) من را به گروه اضافه کن.
+"
+        "2) روی پیام یک نفر ریپلای بزن و بنویس «نجوا».
+"
+        "3) دکمه را بزن و در پی‌وی متن نجوا را برای من بفرست (حداکثر {MAX_ALERT_CHARS} کاراکتر).
+"
         "4) من در گروه یک پیام «نجوا» می‌گذارم که فقط گیرنده (و مالک ربات) می‌تواند آن را باز کند."
     )
     await msg.answer(intro, reply_markup=start_kb())
 
+
+# Accept manual token messages like "wh_xxx" to bind pending whisper
+@dp.message(F.chat.type == ChatType.PRIVATE, F.text.regexp(r'^\s*wh_[A-Za-z0-9_-]{6,}\s*$'))
+async def dm_claim_token(msg: Message):
+    token_param = msg.text.strip()
+    token = token_param[3:]  # remove "wh_"
+    pend = await pending_get(token)
+    if not pend:
+        return await msg.answer("⛔️ این کد منقضی/نامعتبر است. دوباره در گروه «نجوا» بفرست.")
+    if pend["from_id"] != msg.from_user.id:
+        return await msg.answer("⛔️ این کد متعلق به شما نیست.")
+    await waiting_set(msg.from_user.id, token, pend["target_id"], pend["chat_id"], pend["chat_title"])
+    await msg.answer(f"✍️ متن نجوا را بفرست (حداکثر {MAX_ALERT_CHARS} کاراکتر). برای لغو: «انصراف».")
 # ---------- DM: collect text (no / needed) ----------
 @dp.message(F.chat.type == ChatType.PRIVATE, F.text)
 async def dm_collect(msg: Message):
