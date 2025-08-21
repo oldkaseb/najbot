@@ -261,10 +261,12 @@ async def whisper_trigger_norm(msg: Message):
 
 @dp.message(
     F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
-    F.reply_to_message,
-    (Command("نجوا","whisper"))
+    Command(commands=["whisper"])  # Only Latin command is valid in Telegram
 )
 async def whisper_trigger_cmd(msg: Message):
+    # Require reply; if not, guide the user
+    if not msg.reply_to_message:
+        return await msg.reply("برای نجوا باید روی پیامِ شخصِ هدف ریپلای کنید و بعد /whisper را بفرستید.")
     return await whisper_trigger(msg)
 
 # ---------- Start / Onboarding ---------
