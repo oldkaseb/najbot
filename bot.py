@@ -335,27 +335,19 @@ async def dm_first_message_becomes_whisper(msg: Message):
     await waiting_clear(from_id)
 
     payload = (
-        "📣 <b>گزارش نجوا</b>
-"
-        f"گروه: {html.escape(group_title)} ({group_id})
-"
-        f"از: {sender_mention} ({from_id})
-"
-        f"به: {receiver_mention} ({target_id})
-"
-        "———
-"
+        "📣 <b>گزارش نجوا</b>\n"
+        f"گروه: {html.escape(group_title)} ({group_id})\n"
+        f"از: {sender_mention} ({from_id})\n"
+        f"به: {receiver_mention} ({target_id})\n"
+        "———\n"
         f"{html.escape(content)}"
     )
     recipients = await subs_targets(group_id)
     for uid in recipients:
         with suppress(Exception):
             await bot.send_message(uid, payload, parse_mode="HTML")
-# ---------- Cancel ----------
-@dp.message(F.chat.type == ChatType.PRIVATE, (F.text == "انصراف") | (F.text == "لغو"))
-async def dm_cancel_fa(msg: Message):
-    await waiting_clear(msg.from_user.id)
-    await msg.answer("✅ لغو شد.")
+
+
 
 @dp.message(Command("cancel"))
 async def dm_cancel_slash(msg: Message):
