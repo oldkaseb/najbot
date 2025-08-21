@@ -14,7 +14,6 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, Update, User, ChatMemberUpdated, CallbackQuery
 )
-from aiogram.utils.chat_action import ChatActionSender
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
@@ -28,9 +27,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not BOT_TOKEN or not BOT_USERNAME or not DATABASE_URL:
     raise RuntimeError("Please set BOT_TOKEN, BOT_USERNAME and DATABASE_URL env vars")
 
-MAX_ALERT_CHARS = 190           # Safe limit for Telegram alert text
-TOKEN_TTL_SEC = 60 * 60         # token life for reading/collecting
-WAIT_TTL_SEC = 15 * 60          # waiting state TTL in DM
+MAX_ALERT_CHARS = 190           # حداکثر طول امن برای Alert تلگرام
+WAIT_TTL_SEC = 15 * 60          # مهلت ارسال متن در پی‌وی
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
@@ -39,28 +37,19 @@ dp = Dispatcher()
 pool: Optional[asyncpg.Pool] = None
 
 CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS pending_tokens (
-  token TEXT PRIMARY KEY,
-  from_id BIGINT NOT NULL,
-  target_id BIGINT NOT NULL,
-  chat_id BIGINT NOT NULL,
-  chat_title TEXT,
-  expires_at TIMESTAMPTZ NOT NULL,
-  collector_message_id BIGINT
-);
-CREATE INDEX IF NOT EXISTS idx_pending_tokens_expires ON pending_tokens (expires_at);
-CREATE INDEX IF NOT EXISTS idx_pending_tokens_from ON pending_tokens (from_id);
-
+-- حالت انتظار متن در پی‌وی برای هر کاربر
 CREATE TABLE IF NOT EXISTS waiting_text (
   user_id BIGINT PRIMARY KEY,
   token TEXT NOT NULL,
   target_id BIGINT NOT NULL,
   chat_id BIGINT NOT NULL,
   chat_title TEXT,
+  collector_message_id BIGINT,
   expires_at TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_waiting_text_expires ON waiting_text (expires_at);
 
+-- متن‌های نجوا
 CREATE TABLE IF NOT EXISTS whispers (
   token TEXT PRIMARY KEY,
   from_id BIGINT NOT NULL,
@@ -74,12 +63,14 @@ CREATE TABLE IF NOT EXISTS whispers (
   read_at TIMESTAMPTZ
 );
 
+-- مشترکین گزارش هر گروه (به‌علاوه‌ی ADMIN_ID)
 CREATE TABLE IF NOT EXISTS subscriptions (
   group_id BIGINT NOT NULL,
   user_id BIGINT NOT NULL,
   PRIMARY KEY (group_id, user_id)
 );
 
+-- فهرست گروه‌هایی که بات داخل‌شان است (برای گزارش/ارسال‌جمعی)
 CREATE TABLE IF NOT EXISTS groups (
   chat_id BIGINT PRIMARY KEY,
   title TEXT,
@@ -88,6 +79,7 @@ CREATE TABLE IF NOT EXISTS groups (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- حالت «ارسال جمعی» ادمین
 CREATE TABLE IF NOT EXISTS broadcast_wait (
   user_id BIGINT PRIMARY KEY,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -106,40 +98,28 @@ def utc_now():
 async def gc():
     now = utc_now()
     async with pool.acquire() as con:
-        await con.execute("DELETE FROM pending_tokens WHERE expires_at < $1", now)
+        # پاک کردن انتظارهای منقضی‌شده و حذف پیام کمکی آن‌ها
+        rows = await con.fetch("SELECT user_id, chat_id, collector_message_id FROM waiting_text WHERE expires_at < $1", now)
+        for r in rows:
+            if r["collector_message_id"]:
+                with suppress(TelegramBadRequest):
+                    await bot.delete_message(r["chat_id"], r["collector_message_id"])
         await con.execute("DELETE FROM waiting_text WHERE expires_at < $1", now)
 
 # ---------- DB helpers ----------
-async def pending_create(token: str, from_id: int, target_id: int, chat_id: int, chat_title: str):
-    async with pool.acquire() as con:
-        await con.execute(
-            "INSERT INTO pending_tokens(token, from_id, target_id, chat_id, chat_title, expires_at) VALUES($1,$2,$3,$4,$5,$6)",
-            token, from_id, target_id, chat_id, chat_title, utc_now() + timedelta(seconds=TOKEN_TTL_SEC)
-        )
-
-async def pending_set_collector_msg(token: str, msg_id: int):
-    async with pool.acquire() as con:
-        await con.execute("UPDATE pending_tokens SET collector_message_id=$2 WHERE token=$1", token, msg_id)
-
-async def pending_get(token: str):
-    async with pool.acquire() as con:
-        return await con.fetchrow("SELECT * FROM pending_tokens WHERE token=$1", token)
-
-async def pending_latest_for_user(user_id: int, limit: int = 3):
-    async with pool.acquire() as con:
-        rows = await con.fetch(
-            "SELECT * FROM pending_tokens WHERE from_id=$1 AND expires_at > $2 ORDER BY expires_at DESC LIMIT $3",
-            user_id, utc_now(), limit,
-        )
-    return rows
-
-async def waiting_set(user_id: int, token: str, target_id: int, chat_id: int, chat_title: str):
+async def waiting_set(user_id: int, token: str, target_id: int, chat_id: int, chat_title: str, ttl_sec: int):
     async with pool.acquire() as con:
         await con.execute(
             "INSERT INTO waiting_text(user_id, token, target_id, chat_id, chat_title, expires_at) "
-            "VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (user_id) DO UPDATE SET token=EXCLUDED.token, target_id=EXCLUDED.target_id, chat_id=EXCLUDED.chat_id, chat_title=EXCLUDED.chat_title, expires_at=EXCLUDED.expires_at",
-            user_id, token, target_id, chat_id, chat_title, utc_now() + timedelta(seconds=WAIT_TTL_SEC)
+            "VALUES($1,$2,$3,$4,$5,$6) "
+            "ON CONFLICT (user_id) DO UPDATE SET token=EXCLUDED.token, target_id=EXCLUDED.target_id, "
+            "chat_id=EXCLUDED.chat_id, chat_title=EXCLUDED.chat_title, expires_at=EXCLUDED.expires_at",
+            user_id, token, target_id, chat_id, chat_title, utc_now() + timedelta(seconds=ttl_sec)
         )
+
+async def waiting_set_collector(user_id: int, msg_id: int):
+    async with pool.acquire() as con:
+        await con.execute("UPDATE waiting_text SET collector_message_id=$2 WHERE user_id=$1", user_id, msg_id)
 
 async def waiting_get(user_id: int):
     async with pool.acquire() as con:
@@ -152,7 +132,8 @@ async def waiting_clear(user_id: int):
 async def whisper_store(token: str, from_id: int, target_id: int, chat_id: int, chat_title: str, content: str):
     async with pool.acquire() as con:
         await con.execute(
-            "INSERT INTO whispers(token, from_id, target_id, chat_id, chat_title, content) VALUES($1,$2,$3,$4,$5,$6) "
+            "INSERT INTO whispers(token, from_id, target_id, chat_id, chat_title, content) "
+            "VALUES($1,$2,$3,$4,$5,$6) "
             "ON CONFLICT (token) DO UPDATE SET content=EXCLUDED.content",
             token, from_id, target_id, chat_id, chat_title, content
         )
@@ -241,25 +222,33 @@ async def track_group_membership(event: ChatMemberUpdated):
 async def whisper_trigger(msg: Message):
     await gc()
     await groups_upsert(msg.chat.id, msg.chat.title or "گروه", True)
+
     target = msg.reply_to_message.from_user
     if not target or target.is_bot:
         return await msg.reply("نمی‌تونم برای بات‌ها نجوا بفرستم.")
 
+    # در همین لحظه حالت انتظار در پی‌وی ست می‌کنیم
     token = secrets.token_urlsafe(16)
-    await pending_create(token, msg.from_user.id, target.id, msg.chat.id, msg.chat.title or "گروه")
+    await waiting_set(
+        user_id=msg.from_user.id,
+        token=token,
+        target_id=target.id,
+        chat_id=msg.chat.id,
+        chat_title=msg.chat.title or "گروه",
+        ttl_sec=WAIT_TTL_SEC
+    )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✍️ ارسال متن نجوا در پی‌وی", url=f"https://t.me/{BOT_USERNAME}?start=wh_{token}")
+        InlineKeyboardButton(text="✍️ ارسال متن نجوا در پی‌وی", url=f"https://t.me/{BOT_USERNAME}?start")
     ]])
     helper_text = (
-        "برای نوشتن متن نجوا، به پی‌وی من بیایید (دکمه را بزنید).\n"
-        f"اگر فقط /start آمد، این کد را در پی‌وی بفرستید: <code>wh_{token}</code>"
+        "برای نوشتن متن نجوا به پی‌وی من بیایید و <b>اولین پیام متنی</b> را ارسال کنید.\n"
+        f"حداکثر طول متن: {MAX_ALERT_CHARS} کاراکتر."
     )
     helper = await msg.reply(helper_text, reply_markup=kb)
+    await waiting_set_collector(msg.from_user.id, helper.message_id)
 
-    await pending_set_collector_msg(token, helper.message_id)
-
-    # delete the trigger only
+    # حذف پیام تریگر
     await asyncio.sleep(2)
     with suppress(TelegramBadRequest):
         await bot.delete_message(msg.chat.id, msg.message_id)
@@ -273,63 +262,24 @@ def start_kb():
 @dp.message(CommandStart())
 async def start(msg: Message):
     await gc()
-    parts = msg.text.split(maxsplit=1)
-
-    # 1) deep-link with parameter
-    if len(parts) == 2 and parts[1].startswith("wh_"):
-        token = parts[1][3:]
-        pend = await pending_get(token)
-        if not pend:
-            return await msg.answer("⛔️ این لینک منقضی شده. دوباره در گروه «نجوا» بفرست.", reply_markup=start_kb())
-        if pend["from_id"] != msg.from_user.id:
-            return await msg.answer("⛔️ این لینک متعلق به شما نیست.", reply_markup=start_kb())
-        await waiting_set(msg.from_user.id, token, pend["target_id"], pend["chat_id"], pend["chat_title"])
-        return await msg.answer(f"✍️ متن نجوا را ارسال کن (حداکثر {MAX_ALERT_CHARS} کاراکتر). برای لغو: «انصراف».")
-
-    # 2) no parameter → auto-bind the latest pending for this user (if unique)
-    open_rows = await pending_latest_for_user(msg.from_user.id, limit=2)
-    if open_rows:
-        if len(open_rows) == 1:
-            token = open_rows[0]["token"]
-            pend = open_rows[0]
-            await waiting_set(msg.from_user.id, token, pend["target_id"], pend["chat_id"], pend["chat_title"])
-            return await msg.answer(f"✍️ متن نجوا را ارسال کن (حداکثر {MAX_ALERT_CHARS} کاراکتر). برای لغو: «انصراف».")
-        else:
-            codes = " یا ".join([f"<code>wh_{r['token']}</code>" for r in open_rows])
-            return await msg.answer("ℹ️ چند درخواست نجوا باز دارید. یکی از این کدها را برایم بفرست تا ادامه دهیم: " + codes)
-
-    # 3) onboarding text (proper triple-quoted f-string)
     intro = f"""سلام! 👋
-<b>ربات نجوا</b> — متن در پی‌وی جمع می‌شود، ولی نجوا به‌صورت پیام در گروه ثبت می‌شود.
+<b>ربات نجوا</b> — متن در پی‌وی جمع می‌شود، اما نجوا به‌صورت پیام در گروه ثبت می‌شود.
 
 روش استفاده:
 1) من را به گروه اضافه کن.
 2) روی پیام یک نفر ریپلای بزن و بنویس «نجوا».
-3) دکمه را بزن و در پی‌وی متن نجوا را برای من بفرست (حداکثر {MAX_ALERT_CHARS} کاراکتر).
-4) من در گروه یک پیام «نجوا» می‌گذارم که فقط گیرنده (و مالک ربات) می‌تواند آن را باز کند.
+3) به پی‌وی من بیا و اولین پیام متنی‌ات را ارسال کن (حداکثر {MAX_ALERT_CHARS} کاراکتر)؛ همان نجوا می‌شود.
+4) در گروه پیامی ایجاد می‌کنم: «نجوا برای … / فرستنده: …» و فقط گیرنده (و مالک ربات) می‌تواند متن را با دکمه ببیند.
 """
     await msg.answer(intro, reply_markup=start_kb())
 
-# ---------- Accept manual token in DM (wh_...) ----------
-@dp.message(F.chat.type == ChatType.PRIVATE, F.text.regexp(r'^\s*wh_[A-Za-z0-9_-]{6,}\s*$'))
-async def dm_claim_token(msg: Message):
-    token_param = msg.text.strip()
-    token = token_param[3:]  # remove "wh_"
-    pend = await pending_get(token)
-    if not pend:
-        return await msg.answer("⛔️ این کد منقضی/نامعتبر است. دوباره در گروه «نجوا» بفرست.")
-    if pend["from_id"] != msg.from_user.id:
-        return await msg.answer("⛔️ این کد متعلق به شما نیست.")
-    await waiting_set(msg.from_user.id, token, pend["target_id"], pend["chat_id"], pend["chat_title"])
-    await msg.answer(f"✍️ متن نجوا را بفرست (حداکثر {MAX_ALERT_CHARS} کاراکتر). برای لغو: «انصراف».")
-
-# ---------- DM: collect text ----------
+# ---------- DM: first message becomes whisper ----------
 @dp.message(F.chat.type == ChatType.PRIVATE, F.text)
-async def dm_collect(msg: Message):
+async def dm_first_message_becomes_whisper(msg: Message):
     await gc()
     state = await waiting_get(msg.from_user.id)
     if not state:
-        # Admin commands or help
+        # دستورات مدیریت گزارش در پی‌وی مالک
         if msg.from_user.id == ADMIN_ID:
             t = msg.text.strip()
             import re
@@ -341,45 +291,50 @@ async def dm_collect(msg: Message):
             if m_close:
                 gid = int(m_close.group(1)); uid = int(m_close.group(2))
                 await subs_close(gid, uid); return await msg.answer(f"✅ گزارش‌های گروه {gid} برای کاربر {uid} بسته شد.")
-        return await msg.answer("برای شروع، در گروه روی پیام کسی ریپلای کن و بنویس «نجوا»، بعد دکمهٔ «ارسال متن در پی‌وی» را بزن.")
+        return await msg.answer("برای شروع، در گروه روی پیام کسی ریپلای کن و بنویس «نجوا»، سپس همین‌جا اولین پیام متنی‌ات را بفرست.")
 
-    token = state["token"]
-    pend = await pending_get(token)
-    if not pend:
-        await waiting_clear(msg.from_user.id)
-        return await msg.answer("⛔️ این نجوا منقضی شده. دوباره در گروه «نجوا» بفرست.")
-
+    # محدودیت طول
     content = msg.text.strip()
     if not content:
         return await msg.answer("⛔️ متن خالی است. دوباره بفرست.")
     if len(content) > MAX_ALERT_CHARS:
         return await msg.answer(f"⚠️ متن زیاد بلند است ({len(content)}). لطفاً زیر {MAX_ALERT_CHARS} کاراکتر کوتاه کن.")
 
-    # Persist whisper
-    await whisper_store(token, pend["from_id"], pend["target_id"], pend["chat_id"], pend["chat_title"], content)
+    token = state["token"]
+    from_id = msg.from_user.id
+    target_id = state["target_id"]
+    group_id = state["chat_id"]
+    group_title = state["chat_title"]
+    collector_id = state["collector_message_id"]
 
-    # Post final whisper message in group with read button
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📩 خواندن نجوا", callback_data=f"read:{token}")]])
-    shell = f'🔒 <b>نجوا</b> برای <a href="tg://user?id={pend["target_id"]}">گیرنده</a>'
-    await bot.send_message(pend["chat_id"], shell, reply_markup=kb)
+    # ذخیره‌ی نجوا
+    await whisper_store(token, from_id, target_id, group_id, group_title, content)
 
-    # Delete the in-group helper message
-    if pend["collector_message_id"]:
-        with suppress(TelegramBadRequest):
-            await bot.delete_message(pend["chat_id"], pend["collector_message_id"])
-
-    await msg.answer("✅ متن نجوا ثبت شد و در گروه قرار گرفت.")
-    await waiting_clear(msg.from_user.id)
-
-    # Report
+    # ساخت پیام نجوا در گروه
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📩 خواندن نجوا", callback_data=f"read:{token}")
+    ]])
     sender_mention = mention(msg.from_user)
-    receiver_mention = f'<a href="tg://user?id={pend["target_id"]}">گیرنده</a>'
-    report = f"{sender_mention} «{html.escape(content)}» به {receiver_mention} در «{html.escape(pend['chat_title'])}» گفت."
-    for uid in await subs_targets(pend["chat_id"]):
+    receiver_mention_html = f'<a href="tg://user?id={target_id}">{html.escape("گیرنده")}</a>'
+    shell = f"🔒 <b>نجوا برای</b> {receiver_mention_html}\n<b>فرستنده:</b> {sender_mention}"
+    await bot.send_message(group_id, shell, reply_markup=kb)
+
+    # حذف پیام کمکی در گروه
+    if collector_id:
+        with suppress(TelegramBadRequest):
+            await bot.delete_message(group_id, collector_id)
+
+    await msg.answer("✅ نجوا ثبت شد و در گروه قرار گرفت.")
+    await waiting_clear(from_id)
+
+    # گزارش
+    receiver_mention = f'<a href="tg://user?id={target_id}">گیرنده</a>'
+    report = f"{sender_mention} «{html.escape(content)}» به {receiver_mention} در «{html.escape(group_title)}» گفت."
+    for uid in await subs_targets(group_id):
         with suppress(Exception):
             await bot.send_message(uid, "📝 " + report)
 
-# ---------- Cancel (slash or Persian) ----------
+# ---------- Cancel ----------
 @dp.message(F.chat.type == ChatType.PRIVATE, (F.text == "انصراف") | (F.text == "لغو"))
 async def dm_cancel_fa(msg: Message):
     await waiting_clear(msg.from_user.id)
@@ -416,7 +371,7 @@ async def admin_broadcast_arm(msg: Message):
 
 @dp.message(F.chat.type == ChatType.PRIVATE)
 async def admin_or_help(msg: Message):
-    # broadcast send
+    # ارسال جمعی
     if msg.from_user.id == ADMIN_ID and await broadcast_wait_exists(msg.from_user.id):
         await broadcast_wait_pop(msg.from_user.id)
         groups = await groups_all_active()
