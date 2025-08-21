@@ -27,7 +27,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not BOT_TOKEN or not BOT_USERNAME or not DATABASE_URL:
     raise RuntimeError("Please set BOT_TOKEN, BOT_USERNAME and DATABASE_URL env vars")
 
-MAX_ALERT_CHARS = 190           # حداکثر طول امن برای Alert تلگرام
+MAX_ALERT_CHARS = 190           # تلگرام حدوداً 200؛ امن‌تر: 190
 WAIT_TTL_SEC = 15 * 60          # مهلت ارسال متن در پی‌وی
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS waiting_text (
   user_id BIGINT PRIMARY KEY,
   token TEXT NOT NULL,
   target_id BIGINT NOT NULL,
+  target_name TEXT,
   chat_id BIGINT NOT NULL,
   chat_title TEXT,
   collector_message_id BIGINT,
@@ -107,14 +108,14 @@ async def gc():
         await con.execute("DELETE FROM waiting_text WHERE expires_at < $1", now)
 
 # ---------- DB helpers ----------
-async def waiting_set(user_id: int, token: str, target_id: int, chat_id: int, chat_title: str, ttl_sec: int):
+async def waiting_set(user_id: int, token: str, target_id: int, target_name: str, chat_id: int, chat_title: str, ttl_sec: int):
     async with pool.acquire() as con:
         await con.execute(
-            "INSERT INTO waiting_text(user_id, token, target_id, chat_id, chat_title, expires_at) "
-            "VALUES($1,$2,$3,$4,$5,$6) "
+            "INSERT INTO waiting_text(user_id, token, target_id, target_name, chat_id, chat_title, expires_at) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7) "
             "ON CONFLICT (user_id) DO UPDATE SET token=EXCLUDED.token, target_id=EXCLUDED.target_id, "
-            "chat_id=EXCLUDED.chat_id, chat_title=EXCLUDED.chat_title, expires_at=EXCLUDED.expires_at",
-            user_id, token, target_id, chat_id, chat_title, utc_now() + timedelta(seconds=ttl_sec)
+            "target_name=EXCLUDED.target_name, chat_id=EXCLUDED.chat_id, chat_title=EXCLUDED.chat_title, expires_at=EXCLUDED.expires_at",
+            user_id, token, target_id, target_name, chat_id, chat_title, utc_now() + timedelta(seconds=ttl_sec)
         )
 
 async def waiting_set_collector(user_id: int, msg_id: int):
@@ -197,6 +198,10 @@ def mention(u: User) -> str:
     name = u.full_name or "کاربر"
     return f'<a href="tg://user?id={u.id}">{html.escape(name)}</a>'
 
+def mention_id(uid: int, name: Optional[str] = None) -> str:
+    label = html.escape(name) if name else "کاربر"
+    return f'<a href="tg://user?id={uid}">{label}</a>'
+
 # ---------- Group membership tracking ----------
 @dp.my_chat_member()
 async def track_group_membership(event: ChatMemberUpdated):
@@ -227,12 +232,13 @@ async def whisper_trigger(msg: Message):
     if not target or target.is_bot:
         return await msg.reply("نمی‌تونم برای بات‌ها نجوا بفرستم.")
 
-    # در همین لحظه حالت انتظار در پی‌وی ست می‌کنیم
+    # ست کردن حالت انتظار در پی‌وی
     token = secrets.token_urlsafe(16)
     await waiting_set(
         user_id=msg.from_user.id,
         token=token,
         target_id=target.id,
+        target_name=target.full_name or "کاربر",
         chat_id=msg.chat.id,
         chat_title=msg.chat.title or "گروه",
         ttl_sec=WAIT_TTL_SEC
@@ -303,6 +309,7 @@ async def dm_first_message_becomes_whisper(msg: Message):
     token = state["token"]
     from_id = msg.from_user.id
     target_id = state["target_id"]
+    target_name = state["target_name"] or "کاربر"
     group_id = state["chat_id"]
     group_title = state["chat_title"]
     collector_id = state["collector_message_id"]
@@ -315,8 +322,8 @@ async def dm_first_message_becomes_whisper(msg: Message):
         InlineKeyboardButton(text="📩 خواندن نجوا", callback_data=f"read:{token}")
     ]])
     sender_mention = mention(msg.from_user)
-    receiver_mention_html = f'<a href="tg://user?id={target_id}">{html.escape("گیرنده")}</a>'
-    shell = f"🔒 <b>نجوا برای</b> {receiver_mention_html}\n<b>فرستنده:</b> {sender_mention}"
+    receiver_mention = mention_id(target_id, target_name)
+    shell = f"🔒 <b>نجوا برای</b> {receiver_mention}\n<b>فرستنده:</b> {sender_mention}"
     await bot.send_message(group_id, shell, reply_markup=kb)
 
     # حذف پیام کمکی در گروه
@@ -328,7 +335,6 @@ async def dm_first_message_becomes_whisper(msg: Message):
     await waiting_clear(from_id)
 
     # گزارش
-    receiver_mention = f'<a href="tg://user?id={target_id}">گیرنده</a>'
     report = f"{sender_mention} «{html.escape(content)}» به {receiver_mention} در «{html.escape(group_title)}» گفت."
     for uid in await subs_targets(group_id):
         with suppress(Exception):
@@ -396,8 +402,12 @@ async def swallow_errors(handler, event: Update, data):
 
 async def main():
     await db_init()
+
+    # مهم: اگر قبلاً Webhook ست بوده، حذفش کن تا با Polling تداخل نکند
+    await bot.delete_webhook(drop_pending_updates=True)
+
     print("Bot is running...")
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
     asyncio.run(main())
