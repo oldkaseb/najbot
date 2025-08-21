@@ -194,6 +194,13 @@ async def broadcast_wait_is_armed(admin_id: int) -> bool:
     return bool(row["armed"]) if row else False
 
 # ---------- Utils ----------
+
+def _norm_trigger_text(t: str) -> str:
+    if not t:
+        return ""
+    # حذف فاصله‌ها و نیم‌فاصله (ZWNJ) و کوچک‌سازی
+    return ''.join(t.replace('‌','').split()).casefold()
+
 def mention(user: User) -> str:
     name = html.escape(user.full_name or "کاربر")
     return f"<a href=\"tg://user?id={user.id}\">{name}</a>"
@@ -242,6 +249,23 @@ async def whisper_trigger(msg: Message):
     await asyncio.sleep(2)
     with suppress(TelegramBadRequest):
         await bot.delete_message(msg.chat.id, msg.message_id)
+
+# ---------- Robust triggers & fallbacks (for groups) ----------
+@dp.message(
+    F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+    F.reply_to_message,
+    F.text.func(lambda t: _norm_trigger_text(t) in {"نجوا","نجواربات","whisper"})
+)
+async def whisper_trigger_norm(msg: Message):
+    return await whisper_trigger(msg)
+
+@dp.message(
+    F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+    F.reply_to_message,
+    (Command("نجوا") | Command("whisper"))
+)
+async def whisper_trigger_cmd(msg: Message):
+    return await whisper_trigger(msg)
 
 # ---------- Start / Onboarding ---------
 @dp.message(CommandStart())
