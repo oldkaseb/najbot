@@ -12,6 +12,7 @@ from typing import Optional
 
 import asyncpg
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import (
@@ -44,7 +45,8 @@ if not BOT_TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
-bot = Bot(BOT_TOKEN, parse_mode="HTML")
+# aiogram 3.7+: use DefaultBotProperties instead of parse_mode kwarg
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 pool: asyncpg.Pool
 
