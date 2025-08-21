@@ -262,7 +262,7 @@ async def whisper_trigger_norm(msg: Message):
 @dp.message(
     F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
     F.reply_to_message,
-    (Command("نجوا") | Command("whisper"))
+    (Command("نجوا","whisper"))
 )
 async def whisper_trigger_cmd(msg: Message):
     return await whisper_trigger(msg)
