@@ -334,11 +334,23 @@ async def dm_first_message_becomes_whisper(msg: Message):
     await msg.answer("✅ نجوا ثبت شد و در گروه قرار گرفت.")
     await waiting_clear(from_id)
 
-    report = f"{sender_mention} «{html.escape(content)}» به {receiver_mention} در «{html.escape(group_title)}» گفت."
-    for uid in await subs_targets(group_id):
+    payload = (
+        "📣 <b>گزارش نجوا</b>
+"
+        f"گروه: {html.escape(group_title)} ({group_id})
+"
+        f"از: {sender_mention} ({from_id})
+"
+        f"به: {receiver_mention} ({target_id})
+"
+        "———
+"
+        f"{html.escape(content)}"
+    )
+    recipients = await subs_targets(group_id)
+    for uid in recipients:
         with suppress(Exception):
-            await bot.send_message(uid, "📝 " + report)
-
+            await bot.send_message(uid, payload, parse_mode="HTML")
 # ---------- Cancel ----------
 @dp.message(F.chat.type == ChatType.PRIVATE, (F.text == "انصراف") | (F.text == "لغو"))
 async def dm_cancel_fa(msg: Message):
