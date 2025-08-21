@@ -2,6 +2,7 @@ import asyncio
 import html
 import os
 import secrets
+import logging
 from datetime import datetime, timedelta, timezone
 from contextlib import suppress
 from typing import Optional, Set
@@ -17,6 +18,10 @@ from aiogram.types import (
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("najva")
+
 # ---------- Config ----------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -27,8 +32,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not BOT_TOKEN or not BOT_USERNAME or not DATABASE_URL:
     raise RuntimeError("Please set BOT_TOKEN, BOT_USERNAME and DATABASE_URL env vars")
 
-MAX_ALERT_CHARS = 190           # تلگرام حدوداً 200؛ امن‌تر: 190
-WAIT_TTL_SEC = 15 * 60          # مهلت ارسال متن در پی‌وی
+MAX_ALERT_CHARS = 190           # Telegram alert limit is ~200; we use 190 to be safe
+WAIT_TTL_SEC = 15 * 60          # Sender has 15 minutes to DM the text
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
@@ -36,8 +41,7 @@ dp = Dispatcher()
 # ---------- PostgreSQL ----------
 pool: Optional[asyncpg.Pool] = None
 
-CREATE_SQL = """
--- حالت انتظار متن در پی‌وی برای هر کاربر
+CREATE_SQL = """-- Waiting state in DM per user
 CREATE TABLE IF NOT EXISTS waiting_text (
   user_id BIGINT PRIMARY KEY,
   token TEXT NOT NULL,
@@ -50,7 +54,7 @@ CREATE TABLE IF NOT EXISTS waiting_text (
 );
 CREATE INDEX IF NOT EXISTS idx_waiting_text_expires ON waiting_text (expires_at);
 
--- متن‌های نجوا
+-- Stored whispers
 CREATE TABLE IF NOT EXISTS whispers (
   token TEXT PRIMARY KEY,
   from_id BIGINT NOT NULL,
@@ -64,14 +68,14 @@ CREATE TABLE IF NOT EXISTS whispers (
   read_at TIMESTAMPTZ
 );
 
--- مشترکین گزارش هر گروه (به‌علاوه‌ی ADMIN_ID)
+-- Report subscribers
 CREATE TABLE IF NOT EXISTS subscriptions (
   group_id BIGINT NOT NULL,
   user_id BIGINT NOT NULL,
   PRIMARY KEY (group_id, user_id)
 );
 
--- فهرست گروه‌هایی که بات داخل‌شان است (برای گزارش/ارسال‌جمعی)
+-- Track groups (for broadcast/logging)
 CREATE TABLE IF NOT EXISTS groups (
   chat_id BIGINT PRIMARY KEY,
   title TEXT,
@@ -80,7 +84,7 @@ CREATE TABLE IF NOT EXISTS groups (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- حالت «ارسال جمعی» ادمین
+-- Admin broadcast arming
 CREATE TABLE IF NOT EXISTS broadcast_wait (
   user_id BIGINT PRIMARY KEY,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -99,7 +103,6 @@ def utc_now():
 async def gc():
     now = utc_now()
     async with pool.acquire() as con:
-        # پاک کردن انتظارهای منقضی‌شده و حذف پیام کمکی آن‌ها
         rows = await con.fetch("SELECT user_id, chat_id, collector_message_id FROM waiting_text WHERE expires_at < $1", now)
         for r in rows:
             if r["collector_message_id"]:
@@ -232,7 +235,7 @@ async def whisper_trigger(msg: Message):
     if not target or target.is_bot:
         return await msg.reply("نمی‌تونم برای بات‌ها نجوا بفرستم.")
 
-    # ست کردن حالت انتظار در پی‌وی
+    # set waiting state immediately
     token = secrets.token_urlsafe(16)
     await waiting_set(
         user_id=msg.from_user.id,
@@ -253,8 +256,9 @@ async def whisper_trigger(msg: Message):
     )
     helper = await msg.reply(helper_text, reply_markup=kb)
     await waiting_set_collector(msg.from_user.id, helper.message_id)
+    logger.info("whisper_trigger: set waiting for user=%s target=%s in chat=%s", msg.from_user.id, target.id, msg.chat.id)
 
-    # حذف پیام تریگر
+    # delete trigger message
     await asyncio.sleep(2)
     with suppress(TelegramBadRequest):
         await bot.delete_message(msg.chat.id, msg.message_id)
@@ -285,7 +289,7 @@ async def dm_first_message_becomes_whisper(msg: Message):
     await gc()
     state = await waiting_get(msg.from_user.id)
     if not state:
-        # دستورات مدیریت گزارش در پی‌وی مالک
+        # admin report commands
         if msg.from_user.id == ADMIN_ID:
             t = msg.text.strip()
             import re
@@ -299,7 +303,6 @@ async def dm_first_message_becomes_whisper(msg: Message):
                 await subs_close(gid, uid); return await msg.answer(f"✅ گزارش‌های گروه {gid} برای کاربر {uid} بسته شد.")
         return await msg.answer("برای شروع، در گروه روی پیام کسی ریپلای کن و بنویس «نجوا»، سپس همین‌جا اولین پیام متنی‌ات را بفرست.")
 
-    # محدودیت طول
     content = msg.text.strip()
     if not content:
         return await msg.answer("⛔️ متن خالی است. دوباره بفرست.")
@@ -314,10 +317,8 @@ async def dm_first_message_becomes_whisper(msg: Message):
     group_title = state["chat_title"]
     collector_id = state["collector_message_id"]
 
-    # ذخیره‌ی نجوا
     await whisper_store(token, from_id, target_id, group_id, group_title, content)
 
-    # ساخت پیام نجوا در گروه
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="📩 خواندن نجوا", callback_data=f"read:{token}")
     ]])
@@ -326,7 +327,6 @@ async def dm_first_message_becomes_whisper(msg: Message):
     shell = f"🔒 <b>نجوا برای</b> {receiver_mention}\n<b>فرستنده:</b> {sender_mention}"
     await bot.send_message(group_id, shell, reply_markup=kb)
 
-    # حذف پیام کمکی در گروه
     if collector_id:
         with suppress(TelegramBadRequest):
             await bot.delete_message(group_id, collector_id)
@@ -334,7 +334,6 @@ async def dm_first_message_becomes_whisper(msg: Message):
     await msg.answer("✅ نجوا ثبت شد و در گروه قرار گرفت.")
     await waiting_clear(from_id)
 
-    # گزارش
     report = f"{sender_mention} «{html.escape(content)}» به {receiver_mention} در «{html.escape(group_title)}» گفت."
     for uid in await subs_targets(group_id):
         with suppress(Exception):
@@ -377,7 +376,6 @@ async def admin_broadcast_arm(msg: Message):
 
 @dp.message(F.chat.type == ChatType.PRIVATE)
 async def admin_or_help(msg: Message):
-    # ارسال جمعی
     if msg.from_user.id == ADMIN_ID and await broadcast_wait_exists(msg.from_user.id):
         await broadcast_wait_pop(msg.from_user.id)
         groups = await groups_all_active()
@@ -397,15 +395,17 @@ async def admin_or_help(msg: Message):
 async def swallow_errors(handler, event: Update, data):
     try:
         return await handler(event, data)
-    except Exception:
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         return
 
 async def main():
     await db_init()
-
-    # مهم: اگر قبلاً Webhook ست بوده، حذفش کن تا با Polling تداخل نکند
-    await bot.delete_webhook(drop_pending_updates=True)
-
+    # ensure webhook is off to avoid getUpdates conflict
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
     print("Bot is running...")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
