@@ -253,20 +253,11 @@ async def whisper_trigger(msg: Message):
 # ---------- Robust triggers & fallbacks (for groups) ----------
 @dp.message(
     F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
-    F.reply_to_message,
     F.text.func(lambda t: _norm_trigger_text(t) in {"نجوا","نجواربات","whisper"})
 )
 async def whisper_trigger_norm(msg: Message):
-    return await whisper_trigger(msg)
-
-@dp.message(
-    F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
-    Command(commands=["whisper"])  # Only Latin command is valid in Telegram
-)
-async def whisper_trigger_cmd(msg: Message):
-    # Require reply; if not, guide the user
     if not msg.reply_to_message:
-        return await msg.reply("برای نجوا باید روی پیامِ شخصِ هدف ریپلای کنید و بعد /whisper را بفرستید.")
+        return await msg.reply("برای نجوا باید روی پیامِ شخصِ هدف ریپلای کنید و سپس «نجوا» را بفرستید.")
     return await whisper_trigger(msg)
 
 # ---------- Start / Onboarding ---------
