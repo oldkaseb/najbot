@@ -177,11 +177,32 @@ async def get_by_token(token: str):
 # -------------------- Helpers --------------------
 TRIGGERS = {"نجوا", "درگوشی", "سکرت", "whisper", "secret"}
 
-def norm(s: str, bot_username: str) -> str:
+def _unify_ar(text: str) -> str:
+    mapping = {
+        "\\u0643": "ک",  # AR KAF -> FA KAF
+        "\\u0649": "ی",  # AR ALEF MAKSURA -> FA YEH
+        "\\u064A": "ی",  # AR YEH -> FA YEH
+        "\\u06CC": "ی",  # FA YEH normalized
+        "\\u200c": "",   # ZWNJ
+        "\\u200f": "",   # RLM
+        "\\u200e": "",   # LRM
+        "\\u0640": "",   # Tatweel
+    }
+    return "".join(mapping.get(ch, ch) for ch in text)
+
+def _tokens(text: str, bot_username: str) -> list[str]:
+    s = _unify_ar(text or "")
     if bot_username:
-        s = re.sub(rf"@{re.escape(bot_username)}", "", s, flags=re.IGNORECASE)
-    s = s.replace("@", " ")
-    return re.sub(r"[\\W_]+", "", s, flags=re.UNICODE).lower()
+        s = re.sub(rf"@{re.escape(bot_username)}", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"@[\\w_]+", " ", s, flags=re.UNICODE)       # remove other mentions
+    s = re.sub(r"[^\\w]+", " ", s, flags=re.UNICODE)        # non-word -> space
+    toks = [t.lower() for t in s.split() if t.strip()]
+    return toks
+
+def norm(s: str, bot_username: str) -> str:
+    return "".join(_tokens(s, bot_username))
+
+NORMALIZED_TRIGGERS = {norm(x, "") for x in TRIGGERS}
 
 def mention(uid: int, name: str | None) -> str:
     safe = (name or "کاربر").replace("<", "").replace(">", "")
@@ -244,15 +265,23 @@ async def register_group_on_any_message(msg: Message):
         logger.info("Group msg seen chat=%s user=%s text=%r reply=%s", msg.chat.id, msg.from_user and msg.from_user.id, msg.text, bool(msg.reply_to_message))
     await reg_chat(msg.chat.id, "group" if msg.chat.type == ChatType.GROUP else "supergroup", msg.chat.title)
 
-@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.text, F.reply_to_message)
+@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.text)
 async def group_trigger(msg: Message):
     global BOT_USERNAME
     if not BOT_USERNAME:
         me = await bot.get_me()
         BOT_USERNAME = (me.username or "").lstrip("@")
 
-    n = norm(msg.text or "", BOT_USERNAME)
-    if n not in {norm(x, BOT_USERNAME) for x in TRIGGERS}:
+    toks = _tokens(msg.text or "", BOT_USERNAME)
+    matched = (len(toks) == 1 and toks[0] in NORMALIZED_TRIGGERS)
+    if not matched:
+        return
+
+    if not msg.reply_to_message:
+        try:
+            await msg.reply("برای شروع نجوا باید روی پیامِ طرف مقابل <b>ریپلای</b> کنی و یکی از کلمات «نجوا/درگوشی/سکرت» را بفرستی.")
+        except Exception:
+            pass
         return
 
     target = msg.reply_to_message.from_user
@@ -277,7 +306,7 @@ async def group_trigger(msg: Message):
     )
 
     helper = (
-        f"نجوا برای {mention(target.id, short_name(target))} شروع شد.\n"
+        f"نجوا برای {mention(target.id, short_name(target))} شروع شد.\\n"
         f"به پی‌وی من بیا و <b>اولین پیام</b> رو بفرست. (حداکثر {MAX_TEXT} کاراکتر)"
     )
     try:
@@ -288,7 +317,7 @@ async def group_trigger(msg: Message):
         await bot.send_message(
             chat_id=sender.id,
             text=(
-                f"در گروه «{msg.chat.title}» یک نجوا برای {mention(target.id, short_name(target))} باز کردی.\n"
+                f"در گروه «{msg.chat.title}» یک نجوا برای {mention(target.id, short_name(target))} باز کردی.\\n"
                 "اولین پیام متنی که اینجا بفرستی ثبت می‌شه."
             ),
         )
@@ -319,7 +348,7 @@ async def collect_whisper(msg: Message):
         return
 
     caption = (
-        f"نجوا برای {mention(row['target_id'], row['target_name'])} 🔒\n"
+        f"نجوا برای {mention(row['target_id'], row['target_name'])} 🔒\\n"
         f"فرستنده: {mention(row['sender_id'], row['sender_name'])}"
     )
     try:
@@ -446,7 +475,6 @@ async def main():
     me = await bot.get_me()
     logger.info("Bot is @%s (id=%s)", (me.username or ""), me.id)
     asyncio.create_task(janitor())
-    # Explicit allowed updates for clarity
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
