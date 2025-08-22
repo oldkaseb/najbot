@@ -170,6 +170,17 @@ async def get_by_token(token: str):
 TRIGGERS = {"نجوا", "درگوشی", "سکرت", "whisper", "secret"}
 
 def norm(s: str) -> str:
+    # remove bot mention like "نجوا@MyBot" or "نجوا @MyBot"
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        try:
+            me = asyncio.get_event_loop().run_until_complete(bot.get_me())
+            BOT_USERNAME = (me.username or "").lstrip("@")
+        except Exception:
+            BOT_USERNAME = ""
+    if BOT_USERNAME:
+        s = re.sub(rf"@{re.escape(BOT_USERNAME)}", "", s, flags=re.IGNORECASE)
+    s = s.replace("@", " ")  # any other mentions removed
     return re.sub(r"[\W_]+", "", s, flags=re.UNICODE).lower()
 
 def mention(uid: int, name: str | None) -> str:
@@ -233,6 +244,10 @@ async def register_group_on_any_message(msg: Message):
 
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.text, F.reply_to_message)
 async def group_trigger(msg: Message):
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        me = await bot.get_me()
+        BOT_USERNAME = (me.username or "").lstrip("@")
     if norm(msg.text or "") not in {norm(x) for x in TRIGGERS}:
         return
 
