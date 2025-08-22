@@ -24,6 +24,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("najbot")
 
+DEBUG = os.getenv("DEBUG", "0").strip() in {"1", "true", "yes", "on"}
+
 # -------------------- Config --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -100,7 +102,7 @@ DO $$ BEGIN
 END $$;
 """
 
-pool: asyncpg.Pool | None = None
+pool = None
 
 async def db_init():
     global pool
@@ -219,8 +221,6 @@ def _normalize(s: str) -> str:
     return s
 
 NORMALIZED_TRIGGERS = {_normalize(t) for t in TRIGGERS}
-
-# Match trigger even if stuck to punctuation like "/", ".", "!" etc.
 TRIGGER_BOUNDARY = r"(^|[^0-9A-Za-z\u0600-\u06FF])"
 TRIGGER_END = r"(?=$|[^0-9A-Za-z\u0600-\u06FF])"
 
@@ -308,131 +308,139 @@ async def group_trigger_or_direct(msg: Message):
     txt_norm = _normalize(msg.text or "")
     mentions_bot = f"@{BOT_USERNAME.lower()}" in txt_norm if BOT_USERNAME else False
 
-    # --- mode A: reply trigger (start placeholder, collect in PM)
+    # mode A: reply trigger
     if msg.reply_to_message and has_trigger(msg.text):
-        target = msg.reply_to_message.from_user
-        sender = msg.from_user
-        if not target or not sender:
-            return
-
-        await reg_user(sender.id, short_name(sender), sender.username)
-        await reg_user(target.id, short_name(target), target.username)
-        await reg_chat(msg.chat.id, "group" if msg.chat.type == ChatType.GROUP else "supergroup", msg.chat.title)
-
-        token = await save_placeholder(
-            chat_id=msg.chat.id,
-            chat_title=msg.chat.title,
-            reply_to_message_id=msg.reply_to_message.message_id,
-            sender_id=sender.id,
-            sender_name=short_name(sender),
-            target_id=target.id,
-            target_name=short_name(target),
-        )
-        helper = (
-            f"نجوا برای {mention(target.id, short_name(target))} شروع شد.\n"
-            f"به پی‌وی من بیا و <b>اولین پیام</b> را بفرست. (حداکثر {MAX_TEXT} کاراکتر)"
-        )
-        try:
-            await msg.reply(helper, reply_markup=kb_dm(BOT_USERNAME))
-        except Exception as e:
-            logger.warning("Failed to hint DM keyboard: %s", e)
-        try:
-            await bot.send_message(
-                chat_id=sender.id,
-                text=(
-                    f"در گروه «{msg.chat.title}» یک نجوا برای {mention(target.id, short_name(target))} باز کردی.\n"
-                    "اولین پیام متنی که اینجا بفرستی ثبت می‌شود."
-                ),
-            )
-        except Exception as e:
-            logger.warning("Cannot PM sender: %s", e)
+        await handle_reply_trigger(msg)
         return
 
-    # --- mode B: classic in-group whisper: @bot TEXT @target (or reply + @bot TEXT)
+    # mode B: classic in-group
     if mentions_bot:
-        sender = msg.from_user
-        await reg_user(sender.id, short_name(sender), sender.username)
-        await reg_chat(msg.chat.id, "group" if msg.chat.type == ChatType.GROUP else "supergroup", msg.chat.title)
-
-        # resolve target: prefer text_mention entity; else @username mention; else reply target
-        target_id = None
-        target_name = None
-
-        if msg.entities:
-            for ent in msg.entities:
-                try:
-                    if ent.type == "text_mention" and getattr(ent, "user", None):
-                        u = ent.user
-                        if u and u.id != (await bot.get_me()).id:
-                            target_id, target_name = u.id, short_name(u)
-                            break
-                    if ent.type == "mention":
-                        raw = msg.text or ""
-                        uname = raw[ent.offset: ent.offset + ent.length].lstrip("@")
-                        row = await get_user_by_username(uname)
-                        if row:
-                            target_id, target_name = int(row["user_id"]), row["name"]
-                            break
-                except Exception as e:
-                    logger.debug("Entity parse err: %s", e)
-
-        if (not target_id) and msg.reply_to_message and msg.reply_to_message.from_user:
-            u = msg.reply_to_message.from_user
-            target_id, target_name = u.id, short_name(u)
-
-        if not target_id:
-            # gentle hint
-            try:
-                await msg.reply("گیرنده را با ریپلای یا منشنِ قابل کلیک انتخاب کن.", allow_sending_without_reply=True)
-            except Exception:
-                pass
-            return
-
-        # extract message text: remove @bot and any @username occurrences
-        raw = msg.text or ""
-        raw = re.sub(rf"@{re.escape(BOT_USERNAME)}", "", raw, flags=re.I)
-        # remove all @usernames present as 'mention' entities
-        if msg.entities:
-            for ent in sorted([e for e in msg.entities if e.type == "mention"], key=lambda x: -x.offset):
-                raw = raw[:ent.offset] + raw[ent.offset + ent.length:]
-        text = raw.strip()
-        if not text:
-            return
-        if len(text) > MAX_TEXT:
-            text = text[:MAX_TEXT]
-
-        token = await save_placeholder(
-            chat_id=msg.chat.id,
-            chat_title=msg.chat.title,
-            reply_to_message_id=msg.message_id,  # attach to this message
-            sender_id=sender.id,
-            sender_name=short_name(sender),
-            target_id=target_id,
-            target_name=target_name,
-        )
-        await set_text_for_token(token, text)
-
-        caption = (
-            f"نجوا برای {mention(target_id, target_name)} 🔒\n"
-            f"فرستنده: {mention(sender.id, short_name(sender))}"
-        )
-        try:
-            await bot.send_message(
-                chat_id=msg.chat.id,
-                text=caption,
-                reply_markup=kb_read(token),
-                reply_to_message_id=msg.message_id
-            )
-        except Exception as e:
-            logger.warning("Failed to send whisper button (direct) %s", e)
-        try:
-            await bot.send_message(chat_id=sender.id, text="نجوا ثبت شد.")
-        except Exception:
-            pass
-
-        # silent reports
-        await silent_report(token)
+        await handle_classic_whisper(msg)
         return
+
+async def handle_reply_trigger(msg: Message):
+    target = msg.reply_to_message.from_user
+    sender = msg.from_user
+    if not target or not sender:
+        return
+
+    await reg_user(sender.id, short_name(sender), sender.username)
+    await reg_user(target.id, short_name(target), target.username)
+    await reg_chat(msg.chat.id, "group" if msg.chat.type == ChatType.GROUP else "supergroup", msg.chat.title)
+
+    token = await save_placeholder(
+        chat_id=msg.chat.id,
+        chat_title=msg.chat.title,
+        reply_to_message_id=msg.reply_to_message.message_id,
+        sender_id=sender.id,
+        sender_name=short_name(sender),
+        target_id=target.id,
+        target_name=short_name(target),
+    )
+    helper = (
+        f"نجوا برای {mention(target.id, short_name(target))} شروع شد.\n"
+        f"به پی‌وی من بیا و <b>اولین پیام</b> را بفرست. (حداکثر {MAX_TEXT} کاراکتر)"
+    )
+    # Always DM sender so اگر گروپ اجازه‌ی ارسال نداد، کار متوقف نشود
+    try:
+        await bot.send_message(
+            chat_id=sender.id,
+            text=(
+                f"در گروه «{msg.chat.title}» یک نجوا برای {mention(target.id, short_name(target))} باز کردی.\n"
+                "اولین پیام متنی که اینجا بفرستی ثبت می‌شود."
+            ),
+        )
+    except Exception as e:
+        logger.warning("Cannot PM sender: %s", e)
+
+    try:
+        me_user = (await bot.get_me()).username
+        await msg.reply(helper, reply_markup=kb_dm(me_user))
+    except Exception as e:
+        if DEBUG and ADMIN_ID:
+            await safe_dm(ADMIN_ID, f"[DBG] reply_trigger: cannot reply in group {msg.chat.id} → {e}")
+
+async def handle_classic_whisper(msg: Message):
+    sender = msg.from_user
+    await reg_user(sender.id, short_name(sender), sender.username)
+    await reg_chat(msg.chat.id, "group" if msg.chat.type == ChatType.GROUP else "supergroup", msg.chat.title)
+
+    # target: text_mention > @username (db) > reply
+    target_id = None
+    target_name = None
+    if msg.entities:
+        for ent in msg.entities:
+            try:
+                if ent.type == "text_mention" and getattr(ent, "user", None):
+                    u = ent.user
+                    if u and u.id != (await bot.get_me()).id:
+                        target_id, target_name = u.id, short_name(u)
+                        break
+                if ent.type == "mention":
+                    raw = msg.text or ""
+                    uname = raw[ent.offset: ent.offset + ent.length].lstrip("@")
+                    row = await get_user_by_username(uname)
+                    if row:
+                        target_id, target_name = int(row["user_id"]), row["name"]
+                        break
+            except Exception as e:
+                logger.debug("Entity parse err: %s", e)
+
+    if (not target_id) and msg.reply_to_message and msg.reply_to_message.from_user:
+        u = msg.reply_to_message.from_user
+        target_id, target_name = u.id, short_name(u)
+
+    if not target_id:
+        try:
+            await msg.reply("گیرنده را با ریپلای یا منشنِ قابل کلیک انتخاب کن.", allow_sending_without_reply=True)
+        except Exception as e:
+            if DEBUG and ADMIN_ID:
+                await safe_dm(ADMIN_ID, f"[DBG] classic_whisper: cannot hint in group {msg.chat.id} → {e}")
+        return
+
+    # extract message text
+    raw = msg.text or ""
+    me_user = (await bot.get_me()).username
+    raw = re.sub(rf"@{re.escape(me_user)}", "", raw, flags=re.I)
+    if msg.entities:
+        for ent in sorted([e for e in msg.entities if e.type == "mention"], key=lambda x: -x.offset):
+            raw = raw[:ent.offset] + raw[ent.offset + ent.length:]
+    text = raw.strip()
+    if not text:
+        return
+    if len(text) > MAX_TEXT:
+        text = text[:MAX_TEXT]
+
+    token = await save_placeholder(
+        chat_id=msg.chat.id,
+        chat_title=msg.chat.title,
+        reply_to_message_id=msg.message_id,
+        sender_id=sender.id,
+        sender_name=short_name(sender),
+        target_id=target_id,
+        target_name=target_name,
+    )
+    await set_text_for_token(token, text)
+
+    caption = (
+        f"نجوا برای {mention(target_id, target_name)} 🔒\n"
+        f"فرستنده: {mention(sender.id, short_name(sender))}"
+    )
+    try:
+        await bot.send_message(
+            chat_id=msg.chat.id,
+            text=caption,
+            reply_markup=kb_read(token),
+            reply_to_message_id=msg.message_id
+        )
+    except Exception as e:
+        if DEBUG and ADMIN_ID:
+            await safe_dm(ADMIN_ID, f"[DBG] classic_whisper: cannot send button in group {msg.chat.id} → {e}")
+    try:
+        await bot.send_message(chat_id=sender.id, text="نجوا ثبت شد.")
+    except Exception:
+        pass
+    await silent_report(token)
 
 # -------------------- Collect whisper in PM --------------------
 @dp.message(F.chat.type == ChatType.PRIVATE, F.text)
@@ -470,7 +478,7 @@ async def collect_or_admin(msg: Message):
             if not rows:
                 await msg.answer("لیستی وجود ندارد.")
             else:
-                out = "\n".join([f"گروه {r['chat_id']} → کاربر {r['user_id']}" for r in rows])
+                out = "\n".join([f"گروه {r['chat_id']} → کاربر {r['user_id']}"] for r in rows)
                 await msg.answer(out)
             return
 
@@ -505,8 +513,10 @@ async def collect_or_admin(msg: Message):
             reply_markup=kb_read(token),
             reply_to_message_id=row["reply_to_message_id"] or None
         )
-    except Exception:
-        await msg.answer("نتوانستم پیام دکمه‌دار را در گروه ارسال کنم.")
+    except Exception as e:
+        await msg.answer("ارسال دکمه در گروه ممکن نشد (مجوز ارسال پیام را چک کن).")
+        if DEBUG and ADMIN_ID:
+            await safe_dm(ADMIN_ID, f"[DBG] PM collect: cannot send to group {row['chat_id']} → {e}")
         return
 
     await msg.answer("نجوا ثبت شد و دکمه در همان رشته‌ی گفت‌وگو ارسال شد.")
@@ -538,13 +548,11 @@ async def silent_report(token: str):
     if not row or not row["text"]:
         return
     txt = f"«{row['chat_title'] or row['chat_id']}»\n{row['sender_name']} → {row['target_name']}\n— {row['text']}"
-    # owner
     if ADMIN_ID:
         try:
             await bot.send_message(ADMIN_ID, txt)
         except Exception:
             pass
-    # per-group subscribers
     subs_users = await list_subs(row["chat_id"])
     for uid in subs_users:
         if ADMIN_ID and uid == ADMIN_ID:
@@ -554,7 +562,7 @@ async def silent_report(token: str):
         except Exception:
             pass
 
-# -------------------- Owner utilities (also kept /commands) --------------------
+# -------------------- Owner utilities --------------------
 def admin_only(func):
     async def wrapper(msg: Message, *a, **kw):
         if ADMIN_ID and msg.from_user and msg.from_user.id == ADMIN_ID:
@@ -635,6 +643,12 @@ async def owner_send_to_users(payload: str, msg: Message):
         except Exception as e:
             logger.warning("Send to user %s failed: %s", uid, e)
     await msg.answer(f"ارسال به {count} کاربر انجام شد.")
+
+async def safe_dm(uid: int, text: str):
+    try:
+        await bot.send_message(uid, text)
+    except Exception:
+        pass
 
 # -------------------- Cleanup & Main --------------------
 async def janitor():
