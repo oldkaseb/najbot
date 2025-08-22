@@ -453,3 +453,21 @@ if __name__ == "__main__":
 def mention(uid: int, name: str | None) -> str:
     safe = escape((name or "کاربر"), quote=False)
     return f'<a href="tg://user?id={uid}">{safe}</a>'
+def short_name(user) -> str:
+    """Return a compact display name from a Telegram User-like object."""
+    # Prefer full_name if available (Aiogram provides it)
+    name = getattr(user, "full_name", None)
+    if not name:
+        first = getattr(user, "first_name", None) or ""
+        last = getattr(user, "last_name", None) or ""
+        name = (first + " " + last).strip()
+    if not name:
+        username = getattr(user, "username", None)
+        if username:
+            name = f"@{username}"
+    if not name:
+        name = "کاربر"
+    # Be defensive: cap length for DB and UI
+    return name[:64]
+
+    return f'<a href="tg://user?id={uid}">{safe}</a>'
