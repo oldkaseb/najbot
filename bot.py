@@ -272,8 +272,7 @@ async def group_trigger(msg: Message):
     )
 
     helper = (
-        f"نجوا برای {mention(target.id, short_name(target))} شروع شد.
-"
+        f"نجوا برای {mention(target.id, short_name(target))} شروع شد.\n"
         f"به پی‌وی من بیا و <b>اولین پیام</b> رو بفرست. (حداکثر {MAX_TEXT} کاراکتر)"
     )
     try:
@@ -284,8 +283,7 @@ async def group_trigger(msg: Message):
         await bot.send_message(
             chat_id=sender.id,
             text=(
-                f"در گروه «{msg.chat.title}» یک نجوا برای {mention(target.id, short_name(target))} باز کردی.
-"
+                f"در گروه «{msg.chat.title}» یک نجوا برای {mention(target.id, short_name(target))} باز کردی.\n"
                 "اولین پیام متنی که اینجا بفرستی ثبت می‌شه."
             ),
         )
@@ -316,8 +314,7 @@ async def collect_whisper(msg: Message):
         return
 
     caption = (
-        f"نجوا برای {mention(row['target_id'], row['target_name'])} 🔒
-"
+        f"نجوا برای {mention(row['target_id'], row['target_name'])} 🔒\n"
         f"فرستنده: {mention(row['sender_id'], row['sender_name'])}"
     )
     try:
