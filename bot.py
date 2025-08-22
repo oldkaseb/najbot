@@ -14,6 +14,8 @@ from aiogram.types import Message, CallbackQuery, ChatMemberUpdated
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums.parse_mode import ParseMode
+import ssl
+from html import escape
 
 # -------------------- Logging --------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -177,63 +179,27 @@ async def get_by_token(token: str):
 # -------------------- Helpers --------------------
 TRIGGERS = {"نجوا", "درگوشی", "سکرت", "whisper", "secret"}
 
+
 def _unify_ar(text: str) -> str:
     mapping = {
-        "\\u0643": "ک",  # AR KAF -> FA KAF
-        "\\u0649": "ی",  # AR ALEF MAKSURA -> FA YEH
-        "\\u064A": "ی",  # AR YEH -> FA YEH
-        "\\u06CC": "ی",  # FA YEH normalized
-        "\\u200c": "",   # ZWNJ
-        "\\u200f": "",   # RLM
-        "\\u200e": "",   # LRM
-        "\\u0640": "",   # Tatweel
+        "\u0643": "ک",  # ك -> ک
+        "\u0649": "ی",  # ى -> ی
+        "\u064A": "ی",  # ي -> ی
+        "\u06CC": "ی",  # ی -> ی (یکسان‌سازی)
+        "\u200c": "",   # ZWNJ
+        "\u200f": "",   # RLM
+        "\u200e": "",   # LRM
+        "\u0640": "",   # ـ
     }
-    return "".join(mapping.get(ch, ch) for ch in text)
+    # convert escape codes to actual chars to be safe if author typed literals above
+    mapping2 = {}
+    for k, v in mapping.items():
+        try:
+            mapping2[k.encode('utf-8').decode('unicode_escape')] = v
+        except Exception:
+            mapping2[k] = v
+    return "".join(mapping2.get(ch, ch) for ch in text)
 
-def _tokens(text: str, bot_username: str) -> list[str]:
-    s = _unify_ar(text or "")
-    if bot_username:
-        s = re.sub(rf"@{re.escape(bot_username)}", " ", s, flags=re.IGNORECASE)
-    s = re.sub(r"@[\\w_]+", " ", s, flags=re.UNICODE)       # remove other mentions
-    s = re.sub(r"[^\\w]+", " ", s, flags=re.UNICODE)        # non-word -> space
-    toks = [t.lower() for t in s.split() if t.strip()]
-    return toks
-
-def norm(s: str, bot_username: str) -> str:
-    return "".join(_tokens(s, bot_username))
-
-NORMALIZED_TRIGGERS = {norm(x, "") for x in TRIGGERS}
-
-def mention(uid: int, name: str | None) -> str:
-    safe = (name or "کاربر").replace("<", "").replace(">", "")
-    return f'<a href="tg://user?id={uid}">{safe}</a>'
-
-def short_name(u) -> str:
-    full = (u.first_name or "") + (" " + u.last_name if u.last_name else "")
-    if not full.strip() and u.username:
-        full = f"@{u.username}"
-    return (full or "کاربر").strip()[:64]
-
-def kb_dm(username: str | None):
-    if not username:
-        return None
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✉️ ارسال نجوا در پی‌وی", url=f"https://t.me/{username}")
-    return kb.as_markup()
-
-def kb_add_to_group(username: str | None):
-    if not username:
-        return None
-    kb = InlineKeyboardBuilder()
-    kb.button(text="➕ افزودن «درگوشی» به گروه", url=f"https://t.me/{username}?startgroup=true")
-    return kb.as_markup()
-
-def kb_read(token: str):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📩 خواندن نجوا", callback_data=f"read:{token}")
-    return kb.as_markup()
-
-# -------------------- Handlers --------------------
 @dp.message(F.chat.type == ChatType.PRIVATE, Command("start"))
 async def start_pm(msg: Message):
     global BOT_USERNAME
@@ -306,7 +272,8 @@ async def group_trigger(msg: Message):
     )
 
     helper = (
-        f"نجوا برای {mention(target.id, short_name(target))} شروع شد.\\n"
+        f"نجوا برای {mention(target.id, short_name(target))} شروع شد.
+"
         f"به پی‌وی من بیا و <b>اولین پیام</b> رو بفرست. (حداکثر {MAX_TEXT} کاراکتر)"
     )
     try:
@@ -317,7 +284,8 @@ async def group_trigger(msg: Message):
         await bot.send_message(
             chat_id=sender.id,
             text=(
-                f"در گروه «{msg.chat.title}» یک نجوا برای {mention(target.id, short_name(target))} باز کردی.\\n"
+                f"در گروه «{msg.chat.title}» یک نجوا برای {mention(target.id, short_name(target))} باز کردی.
+"
                 "اولین پیام متنی که اینجا بفرستی ثبت می‌شه."
             ),
         )
@@ -348,7 +316,8 @@ async def collect_whisper(msg: Message):
         return
 
     caption = (
-        f"نجوا برای {mention(row['target_id'], row['target_name'])} 🔒\\n"
+        f"نجوا برای {mention(row['target_id'], row['target_name'])} 🔒
+"
         f"فرستنده: {mention(row['sender_id'], row['sender_name'])}"
     )
     try:
@@ -482,3 +451,8 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutting down...")
+
+
+def mention(uid: int, name: str | None) -> str:
+    safe = escape((name or "کاربر"), quote=False)
+    return f'<a href="tg://user?id={uid}">{safe}</a>'
