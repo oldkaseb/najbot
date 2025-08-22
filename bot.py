@@ -239,8 +239,9 @@ async def group_trigger(msg: Message):
         BOT_USERNAME = (me.username or "").lstrip("@")
 
     toks = _tokens(msg.text or "", BOT_USERNAME)
-    matched = (len(toks) == 1 and toks[0] in NORMALIZED_TRIGGERS)
+    matched = any(t in NORMALIZED_TRIGGERS for t in toks)
     if not matched:
+        logger.debug("No trigger match: toks=%s", toks)
         return
 
     if not msg.reply_to_message:
