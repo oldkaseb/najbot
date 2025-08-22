@@ -23,11 +23,14 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 # ---------- Logging ----------
-logging.basicConfig(level=logging.INFO)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+# Silence noisy libs if needed
+logging.getLogger("aiogram").setLevel(logging.WARNING)
 logger = logging.getLogger("najva")
 
 # Allow only Persian/Latin letters and numbers (remove punctuation/emojis)
-ALNUM_FA_LAT = re.compile(r"[^\w\u0600-\u06FF]+", re.UNICODE)
+ALNUM_FA_LAT = re.compile(r"[^^\w\u0600-\u06FF]+", re.UNICODE)
 
 # ---------- Config ----------
 load_dotenv()
@@ -212,13 +215,13 @@ def _norm_trigger_text(t: str) -> str:
     if BOT_USERNAME:
         t = re.sub(fr"@{re.escape(BOT_USERNAME)}", "", t)
     # Remove any non-letter/digit (including punctuation/emojis)
-    t = ALNUM_FA_LAT.sub("", t)
+    t = re.sub(r"[^\w\u0600-\u06FF]+", "", t)
     return t
 
-async def admin_notify(text: str, parse_mode: str = "HTML"):
+async def admin_notify(text: str):
     if ADMIN_ID and ADMIN_ID > 0:
         with suppress(Exception):
-            await bot.send_message(ADMIN_ID, text, parse_mode=parse_mode)
+            await bot.send_message(ADMIN_ID, text)
 
 def _dm_button_markup(bot_username: str) -> Optional[InlineKeyboardMarkup]:
     if not bot_username:
@@ -239,13 +242,10 @@ async def group_whisper(msg: Message):
         if t not in {"نجوا", "نجواربات", "whisper"}:
             return
 
-        if not msg.reply_to_message:
-            return
-
         await gc()
         await groups_upsert(msg.chat.id, msg.chat.title or "گروه", True)
 
-        target = msg.reply_to_message.from_user
+        target = msg.reply_to_message.from_user if msg.reply_to_message else None
         if not target:
             return await msg.reply("روی پیام کاربرِ هدف ریپلای کنید.")
         if target.is_bot:
@@ -268,9 +268,9 @@ async def group_whisper(msg: Message):
             f"حداکثر طول متن: {MAX_ALERT_CHARS} کاراکتر."
         )
         if kb:
-            helper = await msg.reply(helper_text, reply_markup=kb, parse_mode="HTML")
+            helper = await msg.reply(helper_text, reply_markup=kb)
         else:
-            helper = await msg.reply(helper_text, parse_mode="HTML")
+            helper = await msg.reply(helper_text)
         await waiting_set_collector(msg.from_user.id, helper.message_id)
 
         await asyncio.sleep(2)
@@ -278,6 +278,7 @@ async def group_whisper(msg: Message):
             await bot.delete_message(msg.chat.id, msg.message_id)
     except Exception as e:
         logger.exception("group_whisper crashed: %s", e)
+        await admin_notify(f"⚠️ خطای گروه: {type(e).__name__}: {e}")
 
 # ---------- Private: first text collector ----------
 @dp.message(F.chat.type == ChatType.PRIVATE, F.text)
@@ -324,7 +325,7 @@ async def dm_first_message_becomes_whisper(msg: Message):
         sender_mention = mention(msg.from_user)
         receiver_mention = mention_id(target_id, target_name)
         shell = f"🔒 <b>نجوا برای</b> {receiver_mention}\n<b>فرستنده:</b> {sender_mention}"
-        await bot.send_message(group_id, shell, reply_markup=kb_read, parse_mode="HTML")
+        await bot.send_message(group_id, shell, reply_markup=kb_read)
 
         if collector_id:
             with suppress(TelegramBadRequest, TelegramForbiddenError):
@@ -335,7 +336,8 @@ async def dm_first_message_becomes_whisper(msg: Message):
     except Exception as e:
         logger.exception("dm handler crashed: %s", e)
         with suppress(Exception):
-            await msg.answer("❗️ خطایی رخ داد. بعداً دوباره تلاش کنید.")
+            await msg.answer("❗️ خطایی رخ داد.")
+        await admin_notify(f"⚠️ خطای پی‌وی: {type(e).__name__}: {e}")
 
 # ---------- Read whisper ----------
 @dp.callback_query(F.data.startswith("read:"))
@@ -359,7 +361,7 @@ async def cb_read(cb: CallbackQuery):
         )
 
         try:
-            await cb.message.reply(body, parse_mode="HTML")
+            await cb.message.reply(body)
         except TelegramBadRequest:
             await cb.answer(content[:1900], show_alert=True)
 
@@ -377,6 +379,7 @@ async def cb_read(cb: CallbackQuery):
         logger.exception("callback crashed: %s", e)
         with suppress(Exception):
             await cb.answer("خطایی رخ داد.", show_alert=True)
+        await admin_notify(f"⚠️ خطای کال‌بک: {type(e).__name__}: {e}")
 
 # ---------- Group Join/Leave (keep groups table fresh) ----------
 @dp.my_chat_member()
@@ -393,15 +396,18 @@ async def on_my_chat_member(event: ChatMemberUpdated):
 
 # ---------- Main ----------
 async def main():
-    await db_init()
     # Resolve bot username if not provided (prevents bad URL crashes)
     global BOT_USERNAME
-    if not BOT_USERNAME:
+    try:
         me = await bot.get_me()
-        BOT_USERNAME = (me.username or "").lstrip("@")
-        logger.info("Resolved username: %s", BOT_USERNAME or "<empty>")
+        if not BOT_USERNAME:
+            BOT_USERNAME = (me.username or "").lstrip("@")
+        logger.info("Bot online as @%s", BOT_USERNAME or "<empty>")
+    except Exception as e:
+        logger.error("get_me failed: %s", e)
 
-    logger.info("Najva bot (stealth) started. Username=%s", BOT_USERNAME)
+    await db_init()
+    logger.info("DB pool ready.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
