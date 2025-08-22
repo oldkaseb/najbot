@@ -80,6 +80,14 @@ def kb_dm(bot_username: str):
     b.button(text="✉️ رفتن به پی‌وی و ارسال نجوا", url=f"https://t.me/{bot_username}")
     return b.as_markup()
 
+
+def kb_add_to_group(bot_username: str):
+    if not bot_username:
+        return None
+    b = InlineKeyboardBuilder()
+    b.button(text="➕ افزودن «درگوشی» به یک گروه", url=f"https://t.me/{bot_username}?startgroup=true")
+    return b.as_markup()
+
 def kb_read(token: str):
     b = InlineKeyboardBuilder()
     b.button(text="📩 خواندن نجوا", callback_data=f"read:{token}")
@@ -171,7 +179,45 @@ async def db_init_once(mode: str):
     dsn = _sanitize_dsn(DATABASE_URL)
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5, ssl=ssl_opt)
     async with pool.acquire() as con:
+        # Create tables if missing
         await con.execute(CREATE_SQL)
+        # Lightweight migrations for older Railway schemas
+        async def ensure_columns(table, cols):
+            # cols: dict(name -> type)
+            existing = set([r['column_name'] for r in await con.fetch("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema='public' AND table_name=$1
+            """, table)])
+            for name, typ in cols.items():
+                if name not in existing:
+                    await con.execute(f"ALTER TABLE IF EXISTS {table} ADD COLUMN IF NOT EXISTS {name} {typ};")
+        await ensure_columns('waiting_text', {
+            'user_id': 'BIGINT',
+            'token': 'TEXT',
+            'target_id': 'BIGINT',
+            'target_name': 'TEXT',
+            'chat_id': 'BIGINT',
+            'chat_title': 'TEXT',
+            'collector_message_id': 'BIGINT',
+            'expires_at': 'TIMESTAMPTZ'
+        })
+        await ensure_columns('groups', {
+            'chat_id': 'BIGINT',
+            'title': 'TEXT',
+            'active': 'BOOLEAN'
+        })
+        await ensure_columns('whispers', {
+            'token': 'TEXT',
+            'from_id': 'BIGINT',
+            'target_id': 'BIGINT',
+            'chat_id': 'BIGINT',
+            'chat_title': 'TEXT',
+            'content': 'TEXT',
+            'delivered': 'BOOLEAN',
+            'delivered_via': 'TEXT',
+            'read_at': 'TIMESTAMPTZ',
+            'created_at': 'TIMESTAMPTZ'
+        })
 
 async def db_init_with_retry():
     # Try requested mode; if verify-full fails with SSLCertVerificationError, auto-fallback to 'require' once.
@@ -204,7 +250,8 @@ async def db_init_with_retry():
 async def group_whisper(msg: Message):
     try:
         t = _norm_trigger_text(msg.text)
-        if t not in {"نجوا", "نجواربات", "whisper"}:
+        TRIGGERS = {"نجوا", "درگوشی", "سکرت", "whisper", "secret"}
+        if t not in TRIGGERS:
             return
 
         await db_ready.wait()
@@ -244,6 +291,28 @@ async def group_whisper(msg: Message):
         logger.exception(digest)
         await admin_notify("⚠️ " + digest)
 
+
+@dp.message(F.chat.type == ChatType.PRIVATE, F.text == "/start")
+async def start_pm(msg: Message):
+    global BOT_USERNAME
+    try:
+        if not BOT_USERNAME:
+            me = await bot.get_me()
+            BOT_USERNAME = (me.username or "").lstrip("@")
+        intro = (
+            "سلام! من ربات «<b>درگوشی</b>» هستم.\n"
+            "با من می‌تونی توی گروه‌ها پیام‌های <b>نجوا</b> و محرمانه بفرستی.\n\n"
+            "<b>آموزش سریع:</b>\n"
+            "1) منو به گروه اضافه کن.\n"
+            "2) روی پیام کسی که می‌خوای نجوا براش بره <b>ریپلای</b> کن و یکی از کلمات «<code>نجوا</code>»، «<code>درگوشی</code>» یا «<code>سکرت</code>» رو بفرست.\n"
+            "3) من بهت می‌گم بیا پی‌وی؛ <b>اولین پیام متنی</b> که اینجا می‌فرستی، به‌عنوان نجوا ذخیره می‌شه.\n"
+            "4) در گروه، یک دکمه «📩 خواندن نجوا» میاد که فقط گیرنده با زدنش متن رو می‌بینه.\n\n"
+            "حریم‌خصوصی: هیچ‌کس متوجه نمی‌شه چه کسی نجوا رو دیده یا اینکه تو داری نجواها رو می‌بینی. 😉"
+        )
+        await msg.answer(intro, reply_markup=kb_add_to_group(BOT_USERNAME))
+    except Exception as e:
+        await msg.answer("خطا در /start")
+        await admin_notify("⚠️ " + _exc_digest("start_pm", e))
 @dp.message(F.chat.type == ChatType.PRIVATE, F.text)
 async def dm_first_message_becomes_whisper(msg: Message):
     try:
