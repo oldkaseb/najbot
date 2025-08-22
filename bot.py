@@ -1,3 +1,4 @@
+
 import asyncio
 import os
 import re
@@ -131,6 +132,13 @@ async def reg_user(user_id: int, name: str, username: str | None):
             user_id, name, (username or "").lstrip("@")
         )
 
+async def get_user_by_username(username: str):
+    username = (username or "").lstrip("@").lower()
+    if not username:
+        return None
+    async with pool.acquire() as con:
+        return await con.fetchrow("SELECT user_id, name, username FROM users WHERE lower(username)=$1", username)
+
 async def list_groups() -> list[int]:
     async with pool.acquire() as con:
         rows = await con.fetch("SELECT chat_id FROM chats WHERE type IN ('group','supergroup')")
@@ -212,6 +220,17 @@ def _normalize(s: str) -> str:
 
 NORMALIZED_TRIGGERS = {_normalize(t) for t in TRIGGERS}
 
+# Match trigger even if stuck to punctuation like "/", ".", "!" etc.
+TRIGGER_BOUNDARY = r"(^|[^0-9A-Za-z\u0600-\u06FF])"
+TRIGGER_END = r"(?=$|[^0-9A-Za-z\u0600-\u06FF])"
+
+def has_trigger(text: str) -> bool:
+    norm = _normalize(text or "")
+    for t in NORMALIZED_TRIGGERS:
+        if re.search(TRIGGER_BOUNDARY + re.escape(t) + TRIGGER_END, norm):
+            return True
+    return False
+
 def mention(uid: int, name: str | None) -> str:
     safe = escape((name or "کاربر"), quote=False)
     return f'<a href="tg://user?id={uid}">{safe}</a>'
@@ -287,11 +306,10 @@ async def group_trigger_or_direct(msg: Message):
         BOT_USERNAME = (me.username or "").lstrip("@")
 
     txt_norm = _normalize(msg.text or "")
-    has_trigger_word = any((" " + t + " ") in (" " + txt_norm + " ") for t in NORMALIZED_TRIGGERS)
     mentions_bot = f"@{BOT_USERNAME.lower()}" in txt_norm if BOT_USERNAME else False
 
     # --- mode A: reply trigger (start placeholder, collect in PM)
-    if has_trigger_word and msg.reply_to_message:
+    if msg.reply_to_message and has_trigger(msg.text):
         target = msg.reply_to_message.from_user
         sender = msg.from_user
         if not target or not sender:
@@ -316,8 +334,8 @@ async def group_trigger_or_direct(msg: Message):
         )
         try:
             await msg.reply(helper, reply_markup=kb_dm(BOT_USERNAME))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to hint DM keyboard: %s", e)
         try:
             await bot.send_message(
                 chat_id=sender.id,
@@ -326,8 +344,8 @@ async def group_trigger_or_direct(msg: Message):
                     "اولین پیام متنی که اینجا بفرستی ثبت می‌شود."
                 ),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Cannot PM sender: %s", e)
         return
 
     # --- mode B: classic in-group whisper: @bot TEXT @target (or reply + @bot TEXT)
@@ -336,27 +354,47 @@ async def group_trigger_or_direct(msg: Message):
         await reg_user(sender.id, short_name(sender), sender.username)
         await reg_chat(msg.chat.id, "group" if msg.chat.type == ChatType.GROUP else "supergroup", msg.chat.title)
 
-        # resolve target: prefer text_mention entity; else reply target
-        target = None
+        # resolve target: prefer text_mention entity; else @username mention; else reply target
+        target_id = None
+        target_name = None
+
         if msg.entities:
             for ent in msg.entities:
-                if ent.type == "text_mention" and getattr(ent, "user", None):
-                    u = ent.user
-                    if u and u.id != (await bot.get_me()).id:
-                        target = u
-        if (not target) and msg.reply_to_message and msg.reply_to_message.from_user:
-            target = msg.reply_to_message.from_user
+                try:
+                    if ent.type == "text_mention" and getattr(ent, "user", None):
+                        u = ent.user
+                        if u and u.id != (await bot.get_me()).id:
+                            target_id, target_name = u.id, short_name(u)
+                            break
+                    if ent.type == "mention":
+                        raw = msg.text or ""
+                        uname = raw[ent.offset: ent.offset + ent.length].lstrip("@")
+                        row = await get_user_by_username(uname)
+                        if row:
+                            target_id, target_name = int(row["user_id"]), row["name"]
+                            break
+                except Exception as e:
+                    logger.debug("Entity parse err: %s", e)
 
-        if not target:
-            return  # silently ignore if target can't be resolved
+        if (not target_id) and msg.reply_to_message and msg.reply_to_message.from_user:
+            u = msg.reply_to_message.from_user
+            target_id, target_name = u.id, short_name(u)
 
-        await reg_user(target.id, short_name(target), target.username)
+        if not target_id:
+            # gentle hint
+            try:
+                await msg.reply("گیرنده را با ریپلای یا منشنِ قابل کلیک انتخاب کن.", allow_sending_without_reply=True)
+            except Exception:
+                pass
+            return
 
-        # extract text between mentions: remove bot mention and target display from the text
+        # extract message text: remove @bot and any @username occurrences
         raw = msg.text or ""
         raw = re.sub(rf"@{re.escape(BOT_USERNAME)}", "", raw, flags=re.I)
-        if target.username:
-            raw = re.sub(rf"@{re.escape(target.username)}", "", raw, flags=re.I)
+        # remove all @usernames present as 'mention' entities
+        if msg.entities:
+            for ent in sorted([e for e in msg.entities if e.type == "mention"], key=lambda x: -x.offset):
+                raw = raw[:ent.offset] + raw[ent.offset + ent.length:]
         text = raw.strip()
         if not text:
             return
@@ -369,13 +407,13 @@ async def group_trigger_or_direct(msg: Message):
             reply_to_message_id=msg.message_id,  # attach to this message
             sender_id=sender.id,
             sender_name=short_name(sender),
-            target_id=target.id,
-            target_name=short_name(target),
+            target_id=target_id,
+            target_name=target_name,
         )
         await set_text_for_token(token, text)
 
         caption = (
-            f"نجوا برای {mention(target.id, short_name(target))} 🔒\n"
+            f"نجوا برای {mention(target_id, target_name)} 🔒\n"
             f"فرستنده: {mention(sender.id, short_name(sender))}"
         )
         try:
@@ -509,7 +547,6 @@ async def silent_report(token: str):
     # per-group subscribers
     subs_users = await list_subs(row["chat_id"])
     for uid in subs_users:
-        # نخواستیم مزاحم فرستنده/گیرنده بشویم؛ فقط مشترک‌ها
         if ADMIN_ID and uid == ADMIN_ID:
             continue
         try:
