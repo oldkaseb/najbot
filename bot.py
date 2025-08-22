@@ -28,14 +28,13 @@ bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 BOT_USERNAME = ""  # filled later
 
-# -------------------- SSL helper for Railway --------------------
 def _ssl_ctx():
     if DB_SSL_MODE.lower() in {"disable", "false", "0", "off"}:
         return None
     return "require"
 
 # -------------------- DB --------------------
-CREATE_SQL = """
+CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS whispers(
     token TEXT PRIMARY KEY,
     chat_id BIGINT NOT NULL,
@@ -49,19 +48,12 @@ CREATE TABLE IF NOT EXISTS whispers(
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at TIMESTAMPTZ
 );
-CREATE INDEX IF NOT EXISTS idx_whispers_target ON whispers(target_id);
-CREATE INDEX IF NOT EXISTS idx_whispers_sender ON whispers(sender_id);
-CREATE INDEX IF NOT EXISTS idx_whispers_expires ON whispers(expires_at);
-
--- groups/chats registry
 CREATE TABLE IF NOT EXISTS chats(
     chat_id BIGINT PRIMARY KEY,
     type TEXT,
     title TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
--- users registry
 CREATE TABLE IF NOT EXISTS users(
     user_id BIGINT PRIMARY KEY,
     name TEXT,
@@ -70,15 +62,36 @@ CREATE TABLE IF NOT EXISTS users(
 );
 """
 
+# Ensure every needed column exists even if an old table is present
 MIGRATIONS = [
-    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT;",
+    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS token TEXT;",
+    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS chat_id BIGINT;",
     "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS chat_title TEXT;",
-    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;",
+    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT;",
+    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS sender_id BIGINT;",
     "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS sender_name TEXT;",
+    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS target_id BIGINT;",
     "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS target_name TEXT;",
-    "ALTER TABLE IF NOT EXISTS chats ADD COLUMN IF NOT EXISTS type TEXT;",
-    "ALTER TABLE IF NOT EXISTS chats ADD COLUMN IF NOT EXISTS title TEXT;",
+    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS text TEXT;",
+    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();",
+    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;",
+    "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='whispers_pkey') THEN ALTER TABLE whispers ADD PRIMARY KEY (token); END IF; END $$;",
 ]
+
+# Create indexes only if columns exist
+CREATE_INDEXES = """
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='whispers' AND column_name='target_id') THEN
+        CREATE INDEX IF NOT EXISTS idx_whispers_target ON whispers(target_id);
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='whispers' AND column_name='sender_id') THEN
+        CREATE INDEX IF NOT EXISTS idx_whispers_sender ON whispers(sender_id);
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='whispers' AND column_name='expires_at') THEN
+        CREATE INDEX IF NOT EXISTS idx_whispers_expires ON whispers(expires_at);
+    END IF;
+END $$;
+"""
 
 pool: asyncpg.Pool | None = None
 
@@ -86,9 +99,13 @@ async def db_init():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL, ssl=_ssl_ctx())
     async with pool.acquire() as con:
-        await con.execute(CREATE_SQL)
+        # 1) Create tables (no indexes here)
+        await con.execute(CREATE_TABLE)
+        # 2) Make sure columns exist before indexes
         for stmt in MIGRATIONS:
             await con.execute(stmt)
+        # 3) Create indexes conditionally
+        await con.execute(CREATE_INDEXES)
 
 async def reg_chat(chat_id: int, chat_type: str, title: str | None = None):
     async with pool.acquire() as con:
@@ -125,8 +142,9 @@ async def save_placeholder(chat_id: int, chat_title: str | None, reply_to_messag
     async with pool.acquire() as con:
         await con.execute(
             """INSERT INTO whispers(token, chat_id, chat_title, reply_to_message_id,
-                                    sender_id, sender_name, target_id, target_name, text, expires_at)
-               VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULL,$9)""",
+                                    sender_id, sender_name, target_id, target_name, text, created_at, expires_at)
+               VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULL,now(),$9)
+               ON CONFLICT (token) DO NOTHING""",
             token, chat_id, chat_title or "", reply_to_message_id,
             sender_id, sender_name, target_id, target_name, ex
         )
@@ -184,6 +202,7 @@ def kb_read(token: str):
     return kb.as_markup()
 
 # -------------------- Handlers --------------------
+from aiogram.types import ChatMemberUpdated
 
 @dp.message(F.chat.type == ChatType.PRIVATE, Command("start"))
 async def start_pm(msg: Message):
@@ -194,11 +213,11 @@ async def start_pm(msg: Message):
 
     intro = (
         "سلام! من «<b>درگوشی</b>» هستم.\n"
-        "برای فرستادن پیام محرمانه در گروه:\n"
+        "برای پیام محرمانه در گروه:\n"
         "۱) منو به گروه اضافه کن.\n"
-        "۲) روی پیام طرف مقابل <b>ریپلای</b> کن و یکی از کلمات «<code>نجوا</code>»، «<code>درگوشی</code>»، «<code>سکرت</code>» رو بفرست.\n"
-        "۳) اولین پیام متنی که اینجا بفرستی به‌عنوان نجوا ثبت می‌شه.\n"
-        "۴) فقط گیرنده/فرستنده/مالک می‌تونن متن رو با <b>alert</b> خصوصی ببینن.\n"
+        "۲) روی پیام طرف <b>ریپلای</b> کن و «نجوا/درگوشی/سکرت» بفرست.\n"
+        "۳) اولین متن توی پی‌وی رو به عنوان نجوا ثبت می‌کنم.\n"
+        "۴) فقط گیرنده/فرستنده/مالک می‌تونن متن رو با alert خصوصی ببینن.\n"
     )
     await msg.answer(intro, reply_markup=kb_add_to_group(BOT_USERNAME))
 
@@ -335,7 +354,6 @@ async def bc_groups(msg: Message):
 
     count = 0
     if msg.reply_to_message:
-        # forward the replied message
         for gid in groups:
             try:
                 await bot.forward_message(chat_id=gid, from_chat_id=msg.chat.id, message_id=msg.reply_to_message.message_id)
@@ -343,11 +361,11 @@ async def bc_groups(msg: Message):
             except Exception:
                 continue
     else:
-        text = (msg.text or "").split(maxsplit=1)
-        if len(text) < 2:
+        parts = (msg.text or "").split(maxsplit=1)
+        if len(parts) < 2:
             await msg.answer("متن بعد از دستور بنویس یا روی یک پیام ریپلای کن.")
             return
-        payload = text[1]
+        payload = parts[1]
         for gid in groups:
             try:
                 await bot.send_message(gid, payload)
@@ -373,11 +391,11 @@ async def bc_users(msg: Message):
             except Exception:
                 continue
     else:
-        text = (msg.text or "").split(maxsplit=1)
-        if len(text) < 2:
+        parts = (msg.text or "").split(maxsplit=1)
+        if len(parts) < 2:
             await msg.answer("متن بعد از دستور بنویس یا روی یک پیام ریپلای کن.")
             return
-        payload = text[1]
+        payload = parts[1]
         for uid in users:
             try:
                 await bot.send_message(uid, payload)
@@ -386,7 +404,7 @@ async def bc_users(msg: Message):
                 continue
     await msg.answer(f"ارسال به {count} کاربر انجام شد.")
 
-# -------------------- Background cleanup --------------------
+# -------------------- Cleanup --------------------
 async def janitor():
     while True:
         try:
@@ -396,7 +414,6 @@ async def janitor():
             pass
         await asyncio.sleep(1800)
 
-# -------------------- Main --------------------
 async def main():
     await db_init()
     asyncio.create_task(janitor())
