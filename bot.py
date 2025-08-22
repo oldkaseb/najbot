@@ -3,6 +3,7 @@ import asyncio
 import os
 import re
 import uuid
+import logging
 from datetime import datetime, timedelta, timezone
 
 import asyncpg
@@ -14,14 +15,24 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums.parse_mode import ParseMode
 
+# -------------------- Logging --------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("najbot")
+
 # -------------------- Config --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_SSL_MODE = os.getenv("DB_SSL_MODE", "require").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 MAX_TEXT = int(os.getenv("MAX_ALERT_CHARS", "190"))
+LOG_ALL_GROUP = os.getenv("LOG_ALL_GROUP", "0") in {"1","true","True","yes","YES"}
 
 if not BOT_TOKEN:
+    logger.error("BOT_TOKEN is required")
     raise SystemExit("BOT_TOKEN is required")
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -62,7 +73,6 @@ CREATE TABLE IF NOT EXISTS users(
 );
 """
 
-# Ensure every needed column exists even if an old table is present
 MIGRATIONS = [
     "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS token TEXT;",
     "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS chat_id BIGINT;",
@@ -78,7 +88,6 @@ MIGRATIONS = [
     "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='whispers_pkey') THEN ALTER TABLE whispers ADD PRIMARY KEY (token); END IF; END $$;",
 ]
 
-# Create indexes only if columns exist
 CREATE_INDEXES = """
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='whispers' AND column_name='target_id') THEN
@@ -97,15 +106,14 @@ pool: asyncpg.Pool | None = None
 
 async def db_init():
     global pool
+    logger.info("Connecting to Postgres...")
     pool = await asyncpg.create_pool(DATABASE_URL, ssl=_ssl_ctx())
     async with pool.acquire() as con:
-        # 1) Create tables (no indexes here)
         await con.execute(CREATE_TABLE)
-        # 2) Make sure columns exist before indexes
         for stmt in MIGRATIONS:
             await con.execute(stmt)
-        # 3) Create indexes conditionally
         await con.execute(CREATE_INDEXES)
+    logger.info("DB ready.")
 
 async def reg_chat(chat_id: int, chat_type: str, title: str | None = None):
     async with pool.acquire() as con:
@@ -169,19 +177,11 @@ async def get_by_token(token: str):
 # -------------------- Helpers --------------------
 TRIGGERS = {"نجوا", "درگوشی", "سکرت", "whisper", "secret"}
 
-def norm(s: str) -> str:
-    # remove bot mention like "نجوا@MyBot" or "نجوا @MyBot"
-    global BOT_USERNAME
-    if not BOT_USERNAME:
-        try:
-            me = asyncio.get_event_loop().run_until_complete(bot.get_me())
-            BOT_USERNAME = (me.username or "").lstrip("@")
-        except Exception:
-            BOT_USERNAME = ""
-    if BOT_USERNAME:
-        s = re.sub(rf"@{re.escape(BOT_USERNAME)}", "", s, flags=re.IGNORECASE)
-    s = s.replace("@", " ")  # any other mentions removed
-    return re.sub(r"[\W_]+", "", s, flags=re.UNICODE).lower()
+def norm(s: str, bot_username: str) -> str:
+    if bot_username:
+        s = re.sub(rf"@{re.escape(bot_username)}", "", s, flags=re.IGNORECASE)
+    s = s.replace("@", " ")
+    return re.sub(r"[\\W_]+", "", s, flags=re.UNICODE).lower()
 
 def mention(uid: int, name: str | None) -> str:
     safe = (name or "کاربر").replace("<", "").replace(">", "")
@@ -213,8 +213,6 @@ def kb_read(token: str):
     return kb.as_markup()
 
 # -------------------- Handlers --------------------
-from aiogram.types import ChatMemberUpdated
-
 @dp.message(F.chat.type == ChatType.PRIVATE, Command("start"))
 async def start_pm(msg: Message):
     global BOT_USERNAME
@@ -231,15 +229,19 @@ async def start_pm(msg: Message):
         "۴) فقط گیرنده/فرستنده/مالک می‌تونن متن رو با alert خصوصی ببینن.\n"
     )
     await msg.answer(intro, reply_markup=kb_add_to_group(BOT_USERNAME))
+    logger.info("Handled /start for user=%s", msg.from_user.id)
 
 @dp.my_chat_member()
 async def bot_added(e: ChatMemberUpdated):
     chat = e.chat
+    logger.info("my_chat_member: chat=%s type=%s", chat.id, chat.type)
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         await reg_chat(chat.id, "group" if chat.type == ChatType.GROUP else "supergroup", chat.title)
 
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def register_group_on_any_message(msg: Message):
+    if LOG_ALL_GROUP:
+        logger.info("Group msg seen chat=%s user=%s text=%r reply=%s", msg.chat.id, msg.from_user and msg.from_user.id, msg.text, bool(msg.reply_to_message))
     await reg_chat(msg.chat.id, "group" if msg.chat.type == ChatType.GROUP else "supergroup", msg.chat.title)
 
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.text, F.reply_to_message)
@@ -248,13 +250,17 @@ async def group_trigger(msg: Message):
     if not BOT_USERNAME:
         me = await bot.get_me()
         BOT_USERNAME = (me.username or "").lstrip("@")
-    if norm(msg.text or "") not in {norm(x) for x in TRIGGERS}:
+
+    n = norm(msg.text or "", BOT_USERNAME)
+    if n not in {norm(x, BOT_USERNAME) for x in TRIGGERS}:
         return
 
     target = msg.reply_to_message.from_user
     sender = msg.from_user
     if not target or not sender:
         return
+
+    logger.info("Trigger matched in chat=%s by sender=%s -> target=%s", msg.chat.id, sender.id, target.id)
 
     await reg_user(sender.id, short_name(sender), sender.username)
     await reg_user(target.id, short_name(target), target.username)
@@ -270,19 +276,14 @@ async def group_trigger(msg: Message):
         target_name=short_name(target),
     )
 
-    global BOT_USERNAME
-    if not BOT_USERNAME:
-        me = await bot.get_me()
-        BOT_USERNAME = (me.username or "").lstrip("@")
-
     helper = (
         f"نجوا برای {mention(target.id, short_name(target))} شروع شد.\n"
         f"به پی‌وی من بیا و <b>اولین پیام</b> رو بفرست. (حداکثر {MAX_TEXT} کاراکتر)"
     )
     try:
         await msg.reply(helper, reply_markup=kb_dm(BOT_USERNAME))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to reply helper in group: %s", e)
     try:
         await bot.send_message(
             chat_id=sender.id,
@@ -291,8 +292,8 @@ async def group_trigger(msg: Message):
                 "اولین پیام متنی که اینجا بفرستی ثبت می‌شه."
             ),
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to DM sender: %s", e)
 
 @dp.message(F.chat.type == ChatType.PRIVATE, F.text)
 async def collect_whisper(msg: Message):
@@ -308,11 +309,13 @@ async def collect_whisper(msg: Message):
     token = await set_text_for_sender(msg.from_user.id, text)
     if not token:
         await msg.answer("نجوای فعالی پیدا نشد. ابتدا در گروه روی پیام طرف، «نجوا/درگوشی/سکرت» را ریپلای کن.")
+        logger.info("No active placeholder for user=%s", msg.from_user.id)
         return
 
     row = await get_by_token(token)
     if not row:
         await msg.answer("خطای داخلی.")
+        logger.error("Row for token=%s not found after setting text.", token)
         return
 
     caption = (
@@ -326,7 +329,9 @@ async def collect_whisper(msg: Message):
             reply_markup=kb_read(token),
             reply_to_message_id=row["reply_to_message_id"] or None
         )
-    except Exception:
+        logger.info("Posted button in chat=%s token=%s", row["chat_id"], token)
+    except Exception as e:
+        logger.error("Failed to send button to group: %s", e)
         await msg.answer("نتوانستم پیام دکمه‌دار را در گروه ارسال کنم.")
         return
 
@@ -338,6 +343,7 @@ async def read_whisper(cb: CallbackQuery):
     row = await get_by_token(token)
     if not row or not row["text"]:
         await cb.answer("این نجوا معتبر نیست یا منقضی شده.", show_alert=True)
+        logger.info("Invalid/expired token read=%s by user=%s", token, cb.from_user.id)
         return
 
     uid = cb.from_user.id
@@ -347,9 +353,11 @@ async def read_whisper(cb: CallbackQuery):
 
     if not allowed:
         await cb.answer("این نجوا مخصوص گیرنده/فرستنده است.", show_alert=True)
+        logger.info("Unauthorized read attempt token=%s by user=%s", token, uid)
         return
 
     await cb.answer(row["text"], show_alert=True)
+    logger.info("Alert shown token=%s to user=%s", token, uid)
 
 # -------------------- Broadcast / Forward (Admin only) --------------------
 def admin_only(func):
@@ -357,12 +365,14 @@ def admin_only(func):
         if ADMIN_ID and msg.from_user and msg.from_user.id == ADMIN_ID:
             return await func(msg, *a, **kw)
         await msg.answer("فقط مالک اجازه‌ی این دستور را دارد.")
+        logger.warning("Non-admin tried admin command: user=%s", msg.from_user and msg.from_user.id)
     return wrapper
 
 @dp.message(Command("broadcast_groups"))
 @admin_only
 async def bc_groups(msg: Message):
     groups = await list_groups()
+    logger.info("Broadcast to groups count=%d", len(groups))
     if not groups:
         await msg.answer("هیچ گروهی ثبت نشده.")
         return
@@ -373,8 +383,8 @@ async def bc_groups(msg: Message):
             try:
                 await bot.forward_message(chat_id=gid, from_chat_id=msg.chat.id, message_id=msg.reply_to_message.message_id)
                 count += 1
-            except Exception:
-                continue
+            except Exception as e:
+                logger.warning("Forward to group %s failed: %s", gid, e)
     else:
         parts = (msg.text or "").split(maxsplit=1)
         if len(parts) < 2:
@@ -385,14 +395,15 @@ async def bc_groups(msg: Message):
             try:
                 await bot.send_message(gid, payload)
                 count += 1
-            except Exception:
-                continue
+            except Exception as e:
+                logger.warning("Send to group %s failed: %s", gid, e)
     await msg.answer(f"ارسال به {count} گروه انجام شد.")
 
 @dp.message(Command("broadcast_users"))
 @admin_only
 async def bc_users(msg: Message):
     users = await list_users()
+    logger.info("Broadcast to users count=%d", len(users))
     if not users:
         await msg.answer("هیچ کاربری ثبت نشده.")
         return
@@ -403,8 +414,8 @@ async def bc_users(msg: Message):
             try:
                 await bot.forward_message(chat_id=uid, from_chat_id=msg.chat.id, message_id=msg.reply_to_message.message_id)
                 count += 1
-            except Exception:
-                continue
+            except Exception as e:
+                logger.warning("Forward to user %s failed: %s", uid, e)
     else:
         parts = (msg.text or "").split(maxsplit=1)
         if len(parts) < 2:
@@ -415,27 +426,31 @@ async def bc_users(msg: Message):
             try:
                 await bot.send_message(uid, payload)
                 count += 1
-            except Exception:
-                continue
+            except Exception as e:
+                logger.warning("Send to user %s failed: %s", uid, e)
     await msg.answer(f"ارسال به {count} کاربر انجام شد.")
 
-# -------------------- Cleanup --------------------
+# -------------------- Cleanup & Main --------------------
 async def janitor():
     while True:
         try:
             async with pool.acquire() as con:
                 await con.execute("DELETE FROM whispers WHERE expires_at IS NOT NULL AND expires_at < now() - interval '1 hour'")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Janitor error: %s", e)
         await asyncio.sleep(1800)
 
 async def main():
+    logger.info("Starting najbot ...")
     await db_init()
+    me = await bot.get_me()
+    logger.info("Bot is @%s (id=%s)", (me.username or ""), me.id)
     asyncio.create_task(janitor())
-    await dp.start_polling(bot)
+    # Explicit allowed updates for clarity
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        pass
+        logger.info("Shutting down...")
