@@ -1,515 +1,409 @@
 
 import asyncio
-import base64
-import html as _html
 import os
-import secrets
-import logging
 import re
-import ssl as _pyssl
-import traceback
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+import uuid
 from datetime import datetime, timedelta, timezone
-from contextlib import suppress
-from typing import Optional
 
 import asyncpg
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatType, ChatMemberStatus
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import (
-    Message, User, ChatMemberUpdated, CallbackQuery
-)
+from aiogram.enums import ChatType
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery, ChatMemberUpdated
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from dotenv import load_dotenv
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums.parse_mode import ParseMode
 
-# ---------- Logging ----------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
-logging.getLogger("aiogram").setLevel(logging.WARNING)
-logger = logging.getLogger("najva")
-
-# ---------- Config ----------
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
-DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-
-DB_SSL_MODE = os.getenv("DB_SSL_MODE", "require").strip().lower()
-DB_SSL_ROOT_CERT_PATH = os.getenv("DB_SSL_ROOT_CERT_PATH", "").strip()
-DB_SSL_ROOT_CERT_BASE64 = os.getenv("DB_SSL_ROOT_CERT_BASE64", "").strip()
-
-MAX_ALERT_CHARS = 190
-WAIT_TTL_SEC = 15 * 60
+# -------------------- Config --------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_SSL_MODE = os.getenv("DB_SSL_MODE", "require").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
+MAX_TEXT = int(os.getenv("MAX_ALERT_CHARS", "190"))
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
+    raise SystemExit("BOT_TOKEN is required")
 
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
-pool: asyncpg.Pool
+BOT_USERNAME = ""  # filled later
 
-# ---------- Helpers ----------
-ALNUM_FA_LAT = re.compile(r"[^\w؀-ۿ]+", re.UNICODE)
-
-def utc_now():
-    return datetime.now(timezone.utc)
-
-def _norm_trigger_text(t: str) -> str:
-    if not t:
-        return ""
-    t = t.replace("\u200c", " ").casefold()
-    if BOT_USERNAME:
-        t = re.sub(fr"@{re.escape(BOT_USERNAME)}", "", t)
-    t = ALNUM_FA_LAT.sub("", t)
-    return t
-
-async def admin_notify(text: str):
-    if ADMIN_ID and ADMIN_ID > 0:
-        with suppress(Exception):
-            await bot.send_message(ADMIN_ID, text)
-
-def kb_dm(bot_username: str):
-    if not bot_username:
+# -------------------- SSL helper for Railway --------------------
+def _ssl_ctx():
+    if DB_SSL_MODE.lower() in {"disable", "false", "0", "off"}:
         return None
-    b = InlineKeyboardBuilder()
-    b.button(text="✉️ رفتن به پی‌وی و ارسال نجوا", url=f"https://t.me/{bot_username}")
-    return b.as_markup()
+    return "require"
 
-
-def kb_add_to_group(bot_username: str):
-    if not bot_username:
-        return None
-    b = InlineKeyboardBuilder()
-    b.button(text="➕ افزودن «درگوشی» به یک گروه", url=f"https://t.me/{bot_username}?startgroup=true")
-    return b.as_markup()
-
-def kb_read(token: str):
-    b = InlineKeyboardBuilder()
-    b.button(text="📩 خواندن نجوا", callback_data=f"read:{token}")
-    return b.as_markup()
-
-def mention(user: User) -> str:
-    name = _html.escape(user.full_name or "کاربر")
-    return f"<a href=\"tg://user?id={user.id}\">{name}</a>"
-
-def mention_id(uid: int, name: str) -> str:
-    return f"<a href=\"tg://user?id={uid}\">{_html.escape(name)}</a>"
-
-def _exc_digest(prefix: str, e: Exception) -> str:
-    tb = "".join(traceback.format_exception_only(type(e), e)).strip()
-    return f"{prefix}: {type(e).__name__}: {tb[:800]}"
-
-def _sanitize_dsn(dsn: str) -> str:
-    # Remove ssl/sslmode params from URL to avoid overriding our 'ssl' kwarg
-    u = urlsplit(dsn)
-    q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True) if k.lower() not in {"ssl", "sslmode", "sslrootcert"}]
-    new_q = urlencode(q)
-    return urlunsplit((u.scheme, u.netloc, u.path, new_q, u.fragment))
-
-def _ctx_require():
-    # TLS without verification (sslmode=require-like)
-    ctx = _pyssl.SSLContext(_pyssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = _pyssl.CERT_NONE
-    return ctx
-
-def _ctx_verify_full():
-    cafile = None
-    if DB_SSL_ROOT_CERT_BASE64:
-        path = "/tmp/pg_root.crt"
-        with open(path, "wb") as f:
-            f.write(base64.b64decode(DB_SSL_ROOT_CERT_BASE64))
-        cafile = path
-    elif DB_SSL_ROOT_CERT_PATH and os.path.exists(DB_SSL_ROOT_CERT_PATH):
-        cafile = DB_SSL_ROOT_CERT_PATH
-    ctx = _pyssl.create_default_context(cafile=cafile)
-    ctx.check_hostname = True
-    return ctx
-
-# ---------- DB ----------
-CREATE_SQL = r"""
-CREATE TABLE IF NOT EXISTS waiting_text (
-  user_id BIGINT PRIMARY KEY,
-  token TEXT NOT NULL,
-  target_id BIGINT NOT NULL,
-  target_name TEXT,
-  chat_id BIGINT NOT NULL,
-  chat_title TEXT,
-  collector_message_id BIGINT,
-  expires_at TIMESTAMPTZ NOT NULL
+# -------------------- DB --------------------
+CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS whispers(
+    token TEXT PRIMARY KEY,
+    chat_id BIGINT NOT NULL,
+    chat_title TEXT,
+    reply_to_message_id BIGINT,
+    sender_id BIGINT NOT NULL,
+    sender_name TEXT,
+    target_id BIGINT NOT NULL,
+    target_name TEXT,
+    text TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ
 );
-CREATE INDEX IF NOT EXISTS idx_waiting_exp ON waiting_text (expires_at);
+CREATE INDEX IF NOT EXISTS idx_whispers_target ON whispers(target_id);
+CREATE INDEX IF NOT EXISTS idx_whispers_sender ON whispers(sender_id);
+CREATE INDEX IF NOT EXISTS idx_whispers_expires ON whispers(expires_at);
 
-CREATE TABLE IF NOT EXISTS groups (
-  chat_id BIGINT PRIMARY KEY,
-  title TEXT,
-  active BOOLEAN NOT NULL DEFAULT TRUE,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-- groups/chats registry
+CREATE TABLE IF NOT EXISTS chats(
+    chat_id BIGINT PRIMARY KEY,
+    type TEXT,
+    title TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS whispers (
-  token TEXT PRIMARY KEY,
-  from_id BIGINT NOT NULL,
-  target_id BIGINT NOT NULL,
-  chat_id BIGINT NOT NULL,
-  chat_title TEXT,
-  content TEXT NOT NULL,
-  delivered BOOLEAN NOT NULL DEFAULT FALSE,
-  delivered_via TEXT,
-  read_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-- users registry
+CREATE TABLE IF NOT EXISTS users(
+    user_id BIGINT PRIMARY KEY,
+    name TEXT,
+    username TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_whispers_chat ON whispers (chat_id);
 """
 
-async def db_init_once(mode: str):
+MIGRATIONS = [
+    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT;",
+    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS chat_title TEXT;",
+    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;",
+    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS sender_name TEXT;",
+    "ALTER TABLE IF EXISTS whispers ADD COLUMN IF NOT EXISTS target_name TEXT;",
+    "ALTER TABLE IF NOT EXISTS chats ADD COLUMN IF NOT EXISTS type TEXT;",
+    "ALTER TABLE IF NOT EXISTS chats ADD COLUMN IF NOT EXISTS title TEXT;",
+]
+
+pool: asyncpg.Pool | None = None
+
+async def db_init():
     global pool
-    if mode == "disable":
-        ssl_opt = False
-    elif mode == "require":
-        ssl_opt = _ctx_require()
-    else:  # verify-full
-        ssl_opt = _ctx_verify_full()
-
-    dsn = _sanitize_dsn(DATABASE_URL)
-    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5, ssl=ssl_opt)
+    pool = await asyncpg.create_pool(DATABASE_URL, ssl=_ssl_ctx())
     async with pool.acquire() as con:
-        # Create tables if missing
         await con.execute(CREATE_SQL)
-        # Lightweight migrations for older Railway schemas
-        async def ensure_columns(table, cols):
-            # cols: dict(name -> type)
-            existing = set([r['column_name'] for r in await con.fetch("""
-                SELECT column_name FROM information_schema.columns
-                WHERE table_schema='public' AND table_name=$1
-            """, table)])
-            for name, typ in cols.items():
-                if name not in existing:
-                    await con.execute(f"ALTER TABLE IF EXISTS {table} ADD COLUMN IF NOT EXISTS {name} {typ};")
-        await ensure_columns('waiting_text', {
-            'user_id': 'BIGINT',
-            'token': 'TEXT',
-            'target_id': 'BIGINT',
-            'target_name': 'TEXT',
-            'chat_id': 'BIGINT',
-            'chat_title': 'TEXT',
-            'collector_message_id': 'BIGINT',
-            'expires_at': 'TIMESTAMPTZ'
-        })
-        await ensure_columns('groups', {
-            'chat_id': 'BIGINT',
-            'title': 'TEXT',
-            'active': 'BOOLEAN'
-        })
-        await ensure_columns('whispers', {
-            'token': 'TEXT',
-            'from_id': 'BIGINT',
-            'target_id': 'BIGINT',
-            'chat_id': 'BIGINT',
-            'chat_title': 'TEXT',
-            'content': 'TEXT',
-            'delivered': 'BOOLEAN',
-            'delivered_via': 'TEXT',
-            'read_at': 'TIMESTAMPTZ',
-            'created_at': 'TIMESTAMPTZ'
-        })
+        for stmt in MIGRATIONS:
+            await con.execute(stmt)
 
-async def db_init_with_retry():
-    # Try requested mode; if verify-full fails with SSLCertVerificationError, auto-fallback to 'require' once.
-    delay = 3
-    attempt = 0
-    tried_fallback = False
-    mode = DB_SSL_MODE
-    await admin_notify(f"🔐 DB SSL mode: <code>{mode}</code>")
-    while True:
-        try:
-            await db_init_once(mode)
-            logger.info("DB ready with mode=%s", mode)
-            break
-        except Exception as e:
-            # Auto-fallback on cert verify failures
-            msg = _exc_digest("DB init failed", e)
-            if not tried_fallback and mode != "require" and isinstance(e, _pyssl.SSLCertVerificationError):
-                tried_fallback = True
-                await admin_notify("⚠️ verify failure → switching to <code>require</code> once")
-                mode = "require"
-                continue
-            attempt += 1
-            logger.error(msg)
-            await admin_notify(f"❗️ {msg}\n(try {attempt}, retrying {delay}s)")
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 60)
-
-# ---------- Handlers ----------
-@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.text, F.reply_to_message)
-async def group_whisper(msg: Message):
-    try:
-        t = _norm_trigger_text(msg.text)
-        TRIGGERS = {"نجوا", "درگوشی", "سکرت", "whisper", "secret"}
-        if t not in TRIGGERS:
-            return
-
-        await db_ready.wait()
-        await gc()
-        await groups_upsert(msg.chat.id, msg.chat.title or "گروه", True)
-
-        target = msg.reply_to_message.from_user if msg.reply_to_message else None
-        if not target:
-            return await msg.reply("روی پیام کاربرِ هدف ریپلای کنید.")
-        if target.is_bot:
-            return await msg.reply("روی پیامِ یک کاربر (نه ربات) ریپلای کنید.")
-
-        token = secrets.token_urlsafe(16)
-        await waiting_set(
-            user_id=msg.from_user.id,
-            token=token,
-            target_id=target.id,
-            target_name=target.full_name or "کاربر",
-            chat_id=msg.chat.id,
-            chat_title=msg.chat.title or "گروه",
-            ttl_sec=WAIT_TTL_SEC
-        )
-
-        helper_text = "به پی‌وی من بیایید و <b>اولین پیام متنی</b> را ارسال کنید.\n" f"حداکثر طول متن: {MAX_ALERT_CHARS} کاراکتر."
-        markup = kb_dm(BOT_USERNAME)
-        if markup:
-            helper = await msg.reply(helper_text, reply_markup=markup)
-        else:
-            helper = await msg.reply(helper_text)
-        await waiting_set_collector(msg.from_user.id, helper.message_id)
-
-        await asyncio.sleep(2)
-        with suppress(TelegramBadRequest, TelegramForbiddenError):
-            await bot.delete_message(msg.chat.id, msg.message_id)
-    except Exception as e:
-        digest = _exc_digest("group_whisper crashed", e)
-        logger.exception(digest)
-        await admin_notify("⚠️ " + digest)
-
-
-@dp.message(F.chat.type == ChatType.PRIVATE, F.text == "/start")
-async def start_pm(msg: Message):
-    global BOT_USERNAME
-    try:
-        if not BOT_USERNAME:
-            me = await bot.get_me()
-            BOT_USERNAME = (me.username or "").lstrip("@")
-        intro = (
-            "سلام! من ربات «<b>درگوشی</b>» هستم.\n"
-            "با من می‌تونی توی گروه‌ها پیام‌های <b>نجوا</b> و محرمانه بفرستی.\n\n"
-            "<b>آموزش سریع:</b>\n"
-            "1) منو به گروه اضافه کن.\n"
-            "2) روی پیام کسی که می‌خوای نجوا براش بره <b>ریپلای</b> کن و یکی از کلمات «<code>نجوا</code>»، «<code>درگوشی</code>» یا «<code>سکرت</code>» رو بفرست.\n"
-            "3) من بهت می‌گم بیا پی‌وی؛ <b>اولین پیام متنی</b> که اینجا می‌فرستی، به‌عنوان نجوا ذخیره می‌شه.\n"
-            "4) در گروه، یک دکمه «📩 خواندن نجوا» میاد که فقط گیرنده با زدنش متن رو می‌بینه.\n\n"
-            "حریم‌خصوصی: هیچ‌کس متوجه نمی‌شه چه کسی نجوا رو دیده یا اینکه تو داری نجواها رو می‌بینی. 😉"
-        )
-        await msg.answer(intro, reply_markup=kb_add_to_group(BOT_USERNAME))
-    except Exception as e:
-        await msg.answer("خطا در /start")
-        await admin_notify("⚠️ " + _exc_digest("start_pm", e))
-@dp.message(F.chat.type == ChatType.PRIVATE, F.text)
-async def dm_first_message_becomes_whisper(msg: Message):
-    try:
-        await db_ready.wait()
-        await gc()
-        state = await waiting_get(msg.from_user.id)
-        if not state:
-            return await msg.answer("برای شروع: در یک گروه روی پیام کسی ریپلای کن و بنویس «نجوا»، سپس همین‌جا اولین پیام متنی‌ات را بفرست.")
-
-        content = (msg.text or "").strip()
-        if not content:
-            return await msg.answer("⛔️ متن خالی است. دوباره بفرست.")
-        if len(content) > MAX_ALERT_CHARS:
-            return await msg.answer(f"⚠️ متن زیاد بلند است ({len(content)}). حداکثر {MAX_ALERT_CHARS} کاراکتر.")
-
-        token = state["token"]
-        from_id = msg.from_user.id
-        target_id = state["target_id"]
-        target_name = state["target_name"] or "کاربر"
-        group_id = state["chat_id"]
-        group_title = state["chat_title"]
-        collector_id = state["collector_message_id"]
-
-        await whisper_store(token, from_id, target_id, group_id, group_title, content)
-
-        await admin_notify(
-            text=(
-                "🕵️‍♂️ <b>نسخه نجوا برای ادمین</b>\n"
-                f"<b>گروه:</b> {_html.escape(group_title or 'گروه')} ({group_id})\n"
-                f"<b>از:</b> {mention_id(from_id, 'فرستنده')} → <b>به:</b> {mention_id(target_id, target_name)}\n"
-                f"<b>توکن:</b> <code>{token}</code>\n"
-                "———\n"
-                f"{_html.escape(content)}"
-            )
-        )
-
-        shell = f"🔒 <b>نجوا برای</b> {mention_id(target_id, target_name)}\n<b>فرستنده:</b> {mention(msg.from_user)}"
-        await bot.send_message(group_id, shell, reply_markup=kb_read(token))
-
-        if collector_id:
-            with suppress(TelegramBadRequest, TelegramForbiddenError):
-                await bot.delete_message(group_id, collector_id)
-
-        await waiting_clear(msg.from_user.id)
-        await msg.answer("پیام خصوصی ذخیره شد ✅. وقتی گیرنده روی دکمه در گروه کلیک کند، متن را می‌بیند.")
-    except Exception as e:
-        digest = _exc_digest("dm handler crashed", e)
-        logger.exception(digest)
-        with suppress(Exception):
-            await msg.answer("❗️ خطایی رخ داد.")
-        await admin_notify("⚠️ " + digest)
-
-@dp.callback_query(F.data.startswith("read:"))
-async def cb_read(cb: CallbackQuery):
-    try:
-        await db_ready.wait()
-        token = cb.data.split(":", 1)[1]
-        w = await whisper_get(token)
-        if not w:
-            return await cb.answer("یافت نشد یا منقضی شده.", show_alert=True)
-
-        await whisper_mark_delivered(token, via="button")
-
-        content = w["content"]
-        sender_id = w["from_id"]
-        body = "🔓 <b>نجوا</b>\n" f"<b>از:</b> {mention_id(sender_id, 'فرستنده')}\n" "———\n" f"{_html.escape(content)}"
-
-        try:
-            await cb.message.reply(body)
-        except TelegramBadRequest:
-            await cb.answer(content[:1900], show_alert=True)
-
-        await admin_notify(
-            text=(
-                "🕵️‍♂️ <b>گزارش خواندن نجوا</b>\n"
-                f"<b>گروه:</b> {_html.escape(w['chat_title'] or 'گروه')} ({w['chat_id']})\n"
-                f"<b>توکن:</b> <code>{token}</code>\n"
-                "———\n"
-                f"{_html.escape(content)}"
-            )
-        )
-        await whisper_mark_read(token)
-    except Exception as e:
-        digest = _exc_digest("callback crashed", e)
-        logger.exception(digest)
-        with suppress(Exception):
-            await cb.answer("خطایی رخ داد.", show_alert=True)
-        await admin_notify("⚠️ " + digest)
-
-@dp.my_chat_member()
-async def on_my_chat_member(event: ChatMemberUpdated):
-    chat = event.chat
-    if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
-        return
-    new = event.new_chat_member.status
-    title = chat.title or "گروه"
-    if new in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}:
-        await groups_upsert(chat.id, title, True)
-    elif new in {ChatMemberStatus.RESTRICTED, ChatMemberStatus.KICKED, ChatMemberStatus.LEFT}:
-        await groups_set_active(chat.id, False)
-
-# ---------- DB helpers & GC (same as before) ----------
-async def waiting_set(user_id: int, token: str, target_id: int, target_name: str,
-                      chat_id: int, chat_title: str, ttl_sec: int):
-    expires = utc_now() + timedelta(seconds=ttl_sec)
+async def reg_chat(chat_id: int, chat_type: str, title: str | None = None):
     async with pool.acquire() as con:
         await con.execute(
-            """
-            INSERT INTO waiting_text(user_id, token, target_id, target_name, chat_id, chat_title, expires_at)
-            VALUES($1,$2,$3,$4,$5,$6,$7)
-            ON CONFLICT (user_id) DO UPDATE SET token=EXCLUDED.token, target_id=EXCLUDED.target_id,
-              target_name=EXCLUDED.target_name, chat_id=EXCLUDED.chat_id, chat_title=EXCLUDED.chat_title, expires_at=EXCLUDED.expires_at
-            """, user_id, token, target_id, target_name, chat_id, chat_title, expires
+            """INSERT INTO chats(chat_id, type, title)
+               VALUES($1,$2,$3)
+               ON CONFLICT (chat_id) DO UPDATE SET type=EXCLUDED.type, title=EXCLUDED.title, updated_at=now()""",
+            chat_id, chat_type, title or ""
         )
 
-async def waiting_set_collector(user_id: int, message_id: int):
-    async with pool.acquire() as con:
-        await con.execute("UPDATE waiting_text SET collector_message_id=$2 WHERE user_id=$1", user_id, message_id)
-
-async def waiting_get(user_id: int) -> Optional[asyncpg.Record]:
-    async with pool.acquire() as con:
-        return await con.fetchrow("SELECT * FROM waiting_text WHERE user_id=$1", user_id)
-
-async def waiting_clear(user_id: int):
-    async with pool.acquire() as con:
-        await con.execute("DELETE FROM waiting_text WHERE user_id=$1", user_id)
-
-async def whisper_store(token: str, from_id: int, target_id: int, chat_id: int, chat_title: str, content: str):
+async def reg_user(user_id: int, name: str, username: str | None):
     async with pool.acquire() as con:
         await con.execute(
-            "INSERT INTO whispers(token, from_id, target_id, chat_id, chat_title, content) VALUES($1,$2,$3,$4,$5,$6)",
-            token, from_id, target_id, chat_id, chat_title, content
+            """INSERT INTO users(user_id, name, username)
+               VALUES($1,$2,$3)
+               ON CONFLICT (user_id) DO UPDATE SET name=EXCLUDED.name, username=EXCLUDED.username, updated_at=now()""",
+            user_id, name, (username or "").lstrip("@")
         )
 
-async def whisper_get(token: str) -> Optional[asyncpg.Record]:
+async def list_groups() -> list[int]:
+    async with pool.acquire() as con:
+        rows = await con.fetch("SELECT chat_id FROM chats WHERE type IN ('group','supergroup')")
+    return [r["chat_id"] for r in rows]
+
+async def list_users() -> list[int]:
+    async with pool.acquire() as con:
+        rows = await con.fetch("SELECT user_id FROM users")
+    return [r["user_id"] for r in rows]
+
+async def save_placeholder(chat_id: int, chat_title: str | None, reply_to_message_id: int | None,
+                           sender_id: int, sender_name: str, target_id: int, target_name: str) -> str:
+    token = uuid.uuid4().hex
+    ex = datetime.now(timezone.utc) + timedelta(hours=2)
+    async with pool.acquire() as con:
+        await con.execute(
+            """INSERT INTO whispers(token, chat_id, chat_title, reply_to_message_id,
+                                    sender_id, sender_name, target_id, target_name, text, expires_at)
+               VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULL,$9)""",
+            token, chat_id, chat_title or "", reply_to_message_id,
+            sender_id, sender_name, target_id, target_name, ex
+        )
+    return token
+
+async def set_text_for_sender(sender_id: int, text: str) -> str | None:
+    async with pool.acquire() as con:
+        row = await con.fetchrow(
+            "SELECT token FROM whispers WHERE sender_id=$1 AND text IS NULL ORDER BY created_at DESC LIMIT 1",
+            sender_id
+        )
+        if not row:
+            return None
+        token = row["token"]
+        await con.execute("UPDATE whispers SET text=$1 WHERE token=$2", text, token)
+    return token
+
+async def get_by_token(token: str):
     async with pool.acquire() as con:
         return await con.fetchrow("SELECT * FROM whispers WHERE token=$1", token)
 
-async def whisper_mark_delivered(token: str, via: str):
-    async with pool.acquire() as con:
-        await con.execute("UPDATE whispers SET delivered=TRUE, delivered_via=$2 WHERE token=$1", token, via)
+# -------------------- Helpers --------------------
+TRIGGERS = {"نجوا", "درگوشی", "سکرت", "whisper", "secret"}
 
-async def whisper_mark_read(token: str):
-    async with pool.acquire() as con:
-        await con.execute("UPDATE whispers SET read_at=now() WHERE token=$1", token)
+def norm(s: str) -> str:
+    return re.sub(r"[\W_]+", "", s, flags=re.UNICODE).lower()
 
-async def groups_upsert(chat_id: int, title: str, active: bool = True):
-    async with pool.acquire() as con:
-        await con.execute(
-            "INSERT INTO groups(chat_id, title, active) VALUES($1,$2,$3) "
-            "ON CONFLICT (chat_id) DO UPDATE SET title=EXCLUDED.title, active=EXCLUDED.active, updated_at=now()",
-            chat_id, title, active
-        )
+def mention(uid: int, name: str | None) -> str:
+    safe = (name or "کاربر").replace("<", "").replace(">", "")
+    return f'<a href="tg://user?id={uid}">{safe}</a>'
 
-async def groups_set_active(chat_id: int, active: bool):
-    async with pool.acquire() as con:
-        await con.execute("UPDATE groups SET active=$2, updated_at=now() WHERE chat_id=$1", chat_id, active)
+def short_name(u) -> str:
+    full = (u.first_name or "") + (" " + u.last_name if u.last_name else "")
+    if not full.strip() and u.username:
+        full = f"@{u.username}"
+    return (full or "کاربر").strip()[:64]
 
-async def gc():
-    now = utc_now()
-    rows = []
-    async with pool.acquire() as con:
-        try:
-            rows = await con.fetch(
-                "SELECT user_id, chat_id, collector_message_id FROM waiting_text WHERE expires_at < $1 AND collector_message_id IS NOT NULL",
-                now
-            )
-        finally:
-            await con.execute("DELETE FROM waiting_text WHERE expires_at < $1", now)
+def kb_dm(username: str | None):
+    if not username:
+        return None
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✉️ ارسال نجوا در پی‌وی", url=f"https://t.me/{username}")
+    return kb.as_markup()
 
-    for r in rows or []:
-        cid = r["chat_id"]
-        mid = r["collector_message_id"]
-        if cid and mid:
-            with suppress(TelegramBadRequest, TelegramForbiddenError):
-                await bot.delete_message(cid, mid)
+def kb_add_to_group(username: str | None):
+    if not username:
+        return None
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ افزودن «درگوشی» به گروه", url=f"https://t.me/{username}?startgroup=true")
+    return kb.as_markup()
 
-# ---------- Main ----------
-db_ready = asyncio.Event()
+def kb_read(token: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📩 خواندن نجوا", callback_data=f"read:{token}")
+    return kb.as_markup()
 
-async def main():
+# -------------------- Handlers --------------------
+
+@dp.message(F.chat.type == ChatType.PRIVATE, Command("start"))
+async def start_pm(msg: Message):
     global BOT_USERNAME
-    try:
-        me = await bot.get_me()
-        if not BOT_USERNAME:
-            BOT_USERNAME = (me.username or "").lstrip("@")
-        await admin_notify(f"🤖 Bot online as @{BOT_USERNAME or 'unknown'}")
-    except Exception as e:
-        await admin_notify("⚠️ " + _exc_digest("get_me failed", e))
+    me = await bot.get_me()
+    BOT_USERNAME = (me.username or "").lstrip("@")
+    await reg_user(msg.from_user.id, short_name(msg.from_user), msg.from_user.username)
 
-    await db_init_with_retry()
-    db_ready.set()
-    await admin_notify("✅ DB connected.")
+    intro = (
+        "سلام! من «<b>درگوشی</b>» هستم.\n"
+        "برای فرستادن پیام محرمانه در گروه:\n"
+        "۱) منو به گروه اضافه کن.\n"
+        "۲) روی پیام طرف مقابل <b>ریپلای</b> کن و یکی از کلمات «<code>نجوا</code>»، «<code>درگوشی</code>»، «<code>سکرت</code>» رو بفرست.\n"
+        "۳) اولین پیام متنی که اینجا بفرستی به‌عنوان نجوا ثبت می‌شه.\n"
+        "۴) فقط گیرنده/فرستنده/مالک می‌تونن متن رو با <b>alert</b> خصوصی ببینن.\n"
+    )
+    await msg.answer(intro, reply_markup=kb_add_to_group(BOT_USERNAME))
+
+@dp.my_chat_member()
+async def bot_added(e: ChatMemberUpdated):
+    chat = e.chat
+    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await reg_chat(chat.id, "group" if chat.type == ChatType.GROUP else "supergroup", chat.title)
+
+@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def register_group_on_any_message(msg: Message):
+    await reg_chat(msg.chat.id, "group" if msg.chat.type == ChatType.GROUP else "supergroup", msg.chat.title)
+
+@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.text, F.reply_to_message)
+async def group_trigger(msg: Message):
+    if norm(msg.text or "") not in {norm(x) for x in TRIGGERS}:
+        return
+
+    target = msg.reply_to_message.from_user
+    sender = msg.from_user
+    if not target or not sender:
+        return
+
+    await reg_user(sender.id, short_name(sender), sender.username)
+    await reg_user(target.id, short_name(target), target.username)
+    await reg_chat(msg.chat.id, "group" if msg.chat.type == ChatType.GROUP else "supergroup", msg.chat.title)
+
+    token = await save_placeholder(
+        chat_id=msg.chat.id,
+        chat_title=msg.chat.title,
+        reply_to_message_id=msg.reply_to_message.message_id,
+        sender_id=sender.id,
+        sender_name=short_name(sender),
+        target_id=target.id,
+        target_name=short_name(target),
+    )
+
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        me = await bot.get_me()
+        BOT_USERNAME = (me.username or "").lstrip("@")
+
+    helper = (
+        f"نجوا برای {mention(target.id, short_name(target))} شروع شد.\n"
+        f"به پی‌وی من بیا و <b>اولین پیام</b> رو بفرست. (حداکثر {MAX_TEXT} کاراکتر)"
+    )
+    try:
+        await msg.reply(helper, reply_markup=kb_dm(BOT_USERNAME))
+    except Exception:
+        pass
+    try:
+        await bot.send_message(
+            chat_id=sender.id,
+            text=(
+                f"در گروه «{msg.chat.title}» یک نجوا برای {mention(target.id, short_name(target))} باز کردی.\n"
+                "اولین پیام متنی که اینجا بفرستی ثبت می‌شه."
+            ),
+        )
+    except Exception:
+        pass
+
+@dp.message(F.chat.type == ChatType.PRIVATE, F.text)
+async def collect_whisper(msg: Message):
+    await reg_user(msg.from_user.id, short_name(msg.from_user), msg.from_user.username)
+
+    text = (msg.text or "").strip()
+    if not text:
+        return
+    if len(text) > MAX_TEXT:
+        await msg.answer(f"متن طولانیه؛ حداکثر {MAX_TEXT} کاراکتر.")
+        return
+
+    token = await set_text_for_sender(msg.from_user.id, text)
+    if not token:
+        await msg.answer("نجوای فعالی پیدا نشد. ابتدا در گروه روی پیام طرف، «نجوا/درگوشی/سکرت» را ریپلای کن.")
+        return
+
+    row = await get_by_token(token)
+    if not row:
+        await msg.answer("خطای داخلی.")
+        return
+
+    caption = (
+        f"نجوا برای {mention(row['target_id'], row['target_name'])} 🔒\n"
+        f"فرستنده: {mention(row['sender_id'], row['sender_name'])}"
+    )
+    try:
+        await bot.send_message(
+            chat_id=row["chat_id"],
+            text=caption,
+            reply_markup=kb_read(token),
+            reply_to_message_id=row["reply_to_message_id"] or None
+        )
+    except Exception:
+        await msg.answer("نتوانستم پیام دکمه‌دار را در گروه ارسال کنم.")
+        return
+
+    await msg.answer("نجوا ثبت شد و دکمه در همان رشته‌ی گفت‌وگو ارسال شد.")
+
+@dp.callback_query(F.data.startswith("read:"))
+async def read_whisper(cb: CallbackQuery):
+    token = cb.data.split(":", 1)[1]
+    row = await get_by_token(token)
+    if not row or not row["text"]:
+        await cb.answer("این نجوا معتبر نیست یا منقضی شده.", show_alert=True)
+        return
+
+    uid = cb.from_user.id
+    allowed = uid in {row["target_id"], row["sender_id"]}
+    if ADMIN_ID:
+        allowed = allowed or uid == ADMIN_ID
+
+    if not allowed:
+        await cb.answer("این نجوا مخصوص گیرنده/فرستنده است.", show_alert=True)
+        return
+
+    await cb.answer(row["text"], show_alert=True)
+
+# -------------------- Broadcast / Forward (Admin only) --------------------
+def admin_only(func):
+    async def wrapper(msg: Message, *a, **kw):
+        if ADMIN_ID and msg.from_user and msg.from_user.id == ADMIN_ID:
+            return await func(msg, *a, **kw)
+        await msg.answer("فقط مالک اجازه‌ی این دستور را دارد.")
+    return wrapper
+
+@dp.message(Command("broadcast_groups"))
+@admin_only
+async def bc_groups(msg: Message):
+    groups = await list_groups()
+    if not groups:
+        await msg.answer("هیچ گروهی ثبت نشده.")
+        return
+
+    count = 0
+    if msg.reply_to_message:
+        # forward the replied message
+        for gid in groups:
+            try:
+                await bot.forward_message(chat_id=gid, from_chat_id=msg.chat.id, message_id=msg.reply_to_message.message_id)
+                count += 1
+            except Exception:
+                continue
+    else:
+        text = (msg.text or "").split(maxsplit=1)
+        if len(text) < 2:
+            await msg.answer("متن بعد از دستور بنویس یا روی یک پیام ریپلای کن.")
+            return
+        payload = text[1]
+        for gid in groups:
+            try:
+                await bot.send_message(gid, payload)
+                count += 1
+            except Exception:
+                continue
+    await msg.answer(f"ارسال به {count} گروه انجام شد.")
+
+@dp.message(Command("broadcast_users"))
+@admin_only
+async def bc_users(msg: Message):
+    users = await list_users()
+    if not users:
+        await msg.answer("هیچ کاربری ثبت نشده.")
+        return
+
+    count = 0
+    if msg.reply_to_message:
+        for uid in users:
+            try:
+                await bot.forward_message(chat_id=uid, from_chat_id=msg.chat.id, message_id=msg.reply_to_message.message_id)
+                count += 1
+            except Exception:
+                continue
+    else:
+        text = (msg.text or "").split(maxsplit=1)
+        if len(text) < 2:
+            await msg.answer("متن بعد از دستور بنویس یا روی یک پیام ریپلای کن.")
+            return
+        payload = text[1]
+        for uid in users:
+            try:
+                await bot.send_message(uid, payload)
+                count += 1
+            except Exception:
+                continue
+    await msg.answer(f"ارسال به {count} کاربر انجام شد.")
+
+# -------------------- Background cleanup --------------------
+async def janitor():
+    while True:
+        try:
+            async with pool.acquire() as con:
+                await con.execute("DELETE FROM whispers WHERE expires_at IS NOT NULL AND expires_at < now() - interval '1 hour'")
+        except Exception:
+            pass
+        await asyncio.sleep(1800)
+
+# -------------------- Main --------------------
+async def main():
+    await db_init()
+    asyncio.create_task(janitor())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Stopped.")
+        pass
